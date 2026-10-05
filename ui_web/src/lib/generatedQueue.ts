@@ -185,6 +185,7 @@ const RECENT_MAX = 80;
 export class GeneratedQueueController {
   private session: GeneratedSession | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingTopUp: ReturnType<typeof setTimeout> | null = null;
   private aborter: AbortController | null = null;
   private inFlight: Promise<boolean> | null = null;
   private generation = 0;
@@ -262,6 +263,8 @@ export class GeneratedQueueController {
     this.aborter = null;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
+    if (this.pendingTopUp) clearTimeout(this.pendingTopUp);
+    this.pendingTopUp = null;
     this.inFlight = null;
     this.retryStep = 0;
     this.recent = [];
@@ -281,6 +284,8 @@ export class GeneratedQueueController {
     this.retryStep = 0;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
+    if (this.pendingTopUp) clearTimeout(this.pendingTopUp);
+    this.pendingTopUp = null;
     this.settledInput = null;
     this.aborter?.abort();
     this.inFlight = null;
@@ -314,6 +319,23 @@ export class GeneratedQueueController {
   async refillNow(): Promise<boolean> {
     this.rememberCurrent();
     return this.sync(true);
+  }
+
+  /**
+   * Refill a removal deficit after a short settle delay, append-only at the
+   * bottom of the lane. Consecutive removals coalesce into a single top-up;
+   * a new session, an explicit refresh or a stop cancels it. By the time it
+   * fires, an advance may already have healed the deficit — then it no-ops.
+   */
+  refillDebounced(delayMs = 3000): void {
+    if (!this.session) return;
+    if (this.pendingTopUp) clearTimeout(this.pendingTopUp);
+    const session = this.session;
+    this.pendingTopUp = setTimeout(() => {
+      this.pendingTopUp = null;
+      if (this.session !== session) return;
+      void this.sync();
+    }, delayMs);
   }
 
   ensureRunway(): Promise<boolean> {

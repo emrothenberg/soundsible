@@ -136,6 +136,26 @@ describe('GeneratedQueueController', () => {
     h.controller.stop();
   });
 
+  it('refills a removal deficit after a settle delay, coalesced and cancellable', async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    await h.controller.start('auto_mode', seed);
+    const calls = h.requestPlan.mock.calls.length;
+    h.setIndex(1);
+    h.controller.refillDebounced(3000);
+    h.controller.refillDebounced(3000);
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(h.requestPlan).toHaveBeenCalledTimes(calls);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.requestPlan).toHaveBeenCalledTimes(calls + 1);
+    expect(h.requestPlan.mock.calls.at(-1)![3]).toBe(1);
+    h.setIndex(2);
+    h.controller.refillDebounced(3000);
+    h.controller.stop();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(h.requestPlan).toHaveBeenCalledTimes(calls + 1);
+  });
+
   it('replaces the Auto Mode tail immediately when its profile changes', async () => {
     const h = harness();
     await h.controller.start('auto_mode', seed);
