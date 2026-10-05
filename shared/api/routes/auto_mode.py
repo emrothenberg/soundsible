@@ -1430,7 +1430,7 @@ def discovery_music_dj_plan():
     direction = data.get("direction") if isinstance(data.get("direction"), dict) else {}
     try:
         familiarity = float(direction.get("familiarity") or 0)
-        requested_limit = min(8, max(3, int(data.get("limit") or 8)))
+        requested_limit = min(8, max(1, int(data.get("limit") or 8)))
     except (TypeError, ValueError):
         return jsonify({"error": "direction and limit must be numeric"}), 400
     source_profile = "familiar" if familiarity >= 0.35 else "explore" if familiarity <= -0.35 else "balanced"

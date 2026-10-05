@@ -711,7 +711,9 @@ export function createDj(ports: DjPorts, lifetime: RuntimeLifetime) {
     setState('autoMode', 'plan', plan => Object.fromEntries(Object.entries(plan).filter(([id]) => !owned.has(id))));
     setState('autoMode', 'staleSeams', seams => seams.filter(id => !owned.has(id)));
     ports.updateUpcomingPreparation();
-    void generatedQueue?.ensureRunway();
+    // No refill here: the deficit heals append-only on the next advance (or
+    // via the empty-lane safety nets). Fetching mid-gesture rewrites the lane
+    // under repairs and can resurrect the song just removed.
     return track;
   }
   function avoidAutoIdentity(track: Track): void {
@@ -853,7 +855,10 @@ export function createDj(ports: DjPorts, lifetime: RuntimeLifetime) {
     replanTimer = lifetime.setTimeout(() => {
       replanTimer = null;
       setState('autoMode', 'pendingDirection', false);
-      if (state.autoMode.active) void ensureGeneratedQueue().replan(state.autoMode.profile);
+      // The settled route is never rewritten here. A direction tweak only
+      // steers future top-ups; if an advance left a deficit, fill it
+      // append-only. A full refresh happens solely on Retry or a new session.
+      if (state.autoMode.active) void ensureGeneratedQueue().ensureRunway();
     }, REPLAN_DEBOUNCE_MS);
   }
   function cancelRunwayReplan(): void {
@@ -1426,7 +1431,9 @@ export function createDj(ports: DjPorts, lifetime: RuntimeLifetime) {
         void startAutoFromSources();
         return;
       }
-      void generatedQueue?.retry();
+      // The Retry button is the explicit "new route from here": the only
+      // steady-state path that rewrites the settled runway.
+      void generatedQueue?.replan(state.autoMode.profile);
     },
     useAutoTrackAsSource(track: Track): void {
       if (!state.autoMode.active || isPodcastTrack(track)) return;

@@ -1804,11 +1804,18 @@ describe('Auto Mode store contract', () => {
     fireDeckEvent('pause');
     actions.enterAutoMode();
     await vi.waitFor(() => expect(planDjQueue).toHaveBeenCalledTimes(1));
+    const routeBefore = state.playback.queue.map((entry) => entry.queueId);
 
     actions.addAutoSource([{ id: 'steer', title: 'Steer', artist: 'Someone' }], 'Steer');
 
     expect(state.autoMode.pendingDirection).toBe(true);
-    await vi.waitFor(() => expect(planDjQueue).toHaveBeenCalledTimes(2), { timeout: 2000 });
+    // Steering never rewrites the settled route: after the debounce the lane
+    // is untouched and no second plan went out. The steer only shapes the
+    // next top-up.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    expect(planDjQueue).toHaveBeenCalledTimes(1);
+    expect(state.autoMode.pendingDirection).toBe(false);
+    expect(state.playback.queue.map((entry) => entry.queueId)).toEqual(routeBefore);
     expect(state.playback.isPlaying).toBe(false);
   });
 
@@ -1941,7 +1948,7 @@ describe('Auto Mode store contract', () => {
     expect(state.autoMode.sources.flatMap((source) => source.tracks.map((track) => track.id))).toEqual(['placed']);
   });
 
-  it('adds a running source and replans generated music without implying playback', async () => {
+  it('adds a running source without rewriting the settled route or implying playback', async () => {
     const planDjQueue = vi.fn().mockResolvedValue(autoPlan(Array.from({ length: 8 }, (_, index) => `route-${index}`)));
     const { actions, state } = await loadStore({ planDjQueue });
     const current: Track = { id: 'current', title: 'Current', artist: 'Artist', youtube_id: 'yt-current' };
@@ -1953,8 +1960,11 @@ describe('Auto Mode store contract', () => {
     actions.useAutoTrackAsSource(state.playback.queue[2]);
 
     expect(state.autoMode.sources.at(-1)).toMatchObject({ activation: 2, tracks: [expect.objectContaining({ id: 'route-1' })] });
-    await vi.waitFor(() => expect(planDjQueue).toHaveBeenCalledTimes(2));
-    expect(state.playback.queue[0].queueId).toBe(routeBefore[0]);
+    // The steer shapes future top-ups only: the settled route stands and no
+    // second plan goes out.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    expect(planDjQueue).toHaveBeenCalledTimes(1);
+    expect(state.playback.queue.map((track) => track.queueId)).toEqual(routeBefore);
   });
 
   it('places a song in the existing route without making it a source or replacing neighbours', async () => {
@@ -1975,7 +1985,50 @@ describe('Auto Mode store contract', () => {
     expect(planDjQueue).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps all collection occurrences through a bounded repair and a source replan', async () => {
+  it('holds a settled route of eight and tops up one song per advance', async () => {
+    let n = 0;
+    const planDjQueue = vi.fn().mockImplementation(async (body: { limit?: number }) => autoPlan(
+      Array.from({ length: body.limit ?? 8 }, () => `top-${n++}`),
+    ));
+    const { actions, state } = await loadStore({ planDjQueue });
+    const current: Track = { id: 'current', title: 'Current', artist: 'Artist', youtube_id: 'yt-current' };
+    actions.playFrom([current], 0);
+    actions.enterAutoMode();
+    await vi.waitFor(() => expect(state.playback.queue.length).toBe(9));
+    expect(planDjQueue.mock.calls[0][0]).toMatchObject({ limit: 8 });
+    const routeBefore = state.playback.queue.slice(1).map((entry) => entry.id);
+
+    actions.next();
+
+    // The single consumed song is replaced by exactly one top-up…
+    await vi.waitFor(() => expect(planDjQueue).toHaveBeenCalledTimes(2));
+    expect(planDjQueue.mock.calls[1][0]).toMatchObject({ limit: 1 });
+    await vi.waitFor(() => expect(state.playback.queue.length).toBe(10));
+    // …and the settled runway is otherwise untouched: the same songs in the
+    // same order, with the fresh one at the tail.
+    expect(state.playback.queue.slice(2).map((entry) => entry.id)).toEqual([...routeBefore.slice(1), 'top-8']);
+    // …and then it settles: no further plans without a further advance.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(planDjQueue).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshes the whole runway only on explicit Retry', async () => {
+    const planDjQueue = vi.fn()
+      .mockResolvedValueOnce(autoPlan(['old-1', 'old-2']))
+      .mockResolvedValue(autoPlan(['new-1', 'new-2']));
+    const { actions, state } = await loadStore({ planDjQueue });
+    actions.playFrom([t1], 0);
+    actions.enterAutoMode();
+    await vi.waitFor(() => expect(state.playback.queue.length).toBe(3));
+
+    actions.retryAutoRoute();
+
+    await vi.waitFor(() => expect(planDjQueue).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(state.playback.queue.map((row) => row.id)).toEqual(['t1', 'new-1', 'new-2']));
+    actions.exitAutoMode();
+  });
+
+  it('keeps all collection occurrences through a bounded repair and a source steer', async () => {
     const planDjQueue = vi.fn().mockResolvedValue(autoPlan(['route-0', 'route-1']));
     const { actions, state, api } = await loadStore({ planDjQueue });
     actions.playFrom([t1], 0);
@@ -1989,9 +2042,17 @@ describe('Auto Mode store contract', () => {
     await actions.repairAutoRoute();
     expect(api.repairDjRoute.mock.calls[0][0].route).toHaveLength(16);
     expect(state.playback.queue.filter((row) => row.autoRoute?.kind === 'user').map((row) => row.queueId)).toEqual(requests.map((row) => row.queueId));
+    const before = state.playback.queue.map((row) => row.queueId);
     actions.addAutoSource([t2], 'Direction');
-    await vi.waitFor(() => expect(planDjQueue).toHaveBeenCalledTimes(2));
+    // A steer is not a replan: the settled route (and every collection
+    // occurrence in it) stands without the runway being rewritten. A deficit
+    // below the settled length may still top up append-only, which never
+    // moves what is already there.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await flush();
     expect(state.playback.queue.filter((row) => row.autoRoute?.kind === 'user').map((row) => row.queueId)).toEqual(requests.map((row) => row.queueId));
+    expect(state.playback.queue.slice(0, before.length).map((row) => row.queueId)).toEqual(before);
+    actions.exitAutoMode();
   });
 
   it('rebases pending collection requests onto a changed route without resurrecting removed songs', async () => {

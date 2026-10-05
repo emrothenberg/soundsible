@@ -123,6 +123,19 @@ describe('GeneratedQueueController', () => {
     h.controller.stop();
   });
 
+  it('tops up a settled Auto Mode route by its deficit instead of refilling in bulk', async () => {
+    const h = harness();
+    await h.controller.start('auto_mode', seed);
+    expect(h.requestPlan.mock.calls[0][3]).toBe(8);
+    h.setIndex(1);
+
+    await h.controller.ensureRunway();
+
+    expect(h.requestPlan).toHaveBeenCalledTimes(2);
+    expect(h.requestPlan.mock.calls[1][3]).toBe(1);
+    h.controller.stop();
+  });
+
   it('replaces the Auto Mode tail immediately when its profile changes', async () => {
     const h = harness();
     await h.controller.start('auto_mode', seed);

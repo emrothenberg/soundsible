@@ -151,11 +151,16 @@ const TARGET_LOOKAHEAD = 8;
  * matters is the one that had time to fail, back off and succeed before the
  * listener reaches the end of the lane. Three tracks of warning was enough on
  * Wi-Fi and not enough on a phone changing cells.
+ *
+ * Auto Mode is the exception: its route is settled at exactly TARGET_LOOKAHEAD
+ * and topped up by its own deficit (usually one song) on every advance, so the
+ * threshold equals the target. Refills are append-only; nothing rewrites the
+ * runway except an explicit refresh (Retry) or a new session.
  */
 const REFILL_THRESHOLD: Record<ListeningPlanIntent, number> = {
   autoplay: 5,
   radio: 5,
-  auto_mode: 5,
+  auto_mode: TARGET_LOOKAHEAD,
 };
 
 function sessionId(): string {
@@ -266,10 +271,17 @@ export class GeneratedQueueController {
   }
 
   /** Rewrite the uncommitted runway — everything the listener has not started
-   * hearing yet — after a direction, DJ or request change. */
+   * hearing yet — after an explicit user request for a new route (Retry).
+   * Direction, profile and source tweaks never call this: they only steer
+   * future top-ups, so the settled route is never rewritten under the
+   * listener. Backoff is reset because an explicit press is a fresh attempt. */
   replan(profile: AutoProfile): Promise<boolean> {
     if (this.session?.intent !== 'auto_mode') return Promise.resolve(false);
     this.session.profile = profile;
+    this.retryStep = 0;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.settledInput = null;
     this.aborter?.abort();
     this.inFlight = null;
     return this.sync(true, true);
