@@ -95,7 +95,7 @@ describe('GeneratedQueueController', () => {
     radio.controller.stop();
 
     const autoplay = harness();
-    await autoplay.controller.ensureAutoplay(seed, true);
+    await autoplay.controller.ensureAutoplay(seed);
     expect(autoplay.requestPlan.mock.calls[0][0]).toBe('autoplay');
     autoplay.controller.stop();
 
@@ -120,6 +120,40 @@ describe('GeneratedQueueController', () => {
 
     expect(h.requestPlan).toHaveBeenCalledTimes(2);
     expect(h.requestPlan.mock.calls[1][2]).toMatchObject(seed);
+    h.controller.stop();
+  });
+
+  it('fires no refresh while the lane is populated, however it is asked', async () => {
+    const h = harness();
+    await h.controller.start('auto_mode', seed);
+    const calls = h.requestPlan.mock.calls.length;
+
+    await h.controller.ensureRunway();
+    await h.controller.refillNow();
+    await h.controller.replan('familiar');
+
+    expect(h.requestPlan).toHaveBeenCalledTimes(calls);
+    expect(h.onStatus).toHaveBeenLastCalledWith('auto_mode', 'ready');
+    h.controller.stop();
+  });
+
+  it('drops a late plan when the lane filled while it was in flight', async () => {
+    const h = harness();
+    await h.controller.start('auto_mode', seed);
+    const applied = h.applyPlan.mock.calls.length;
+    h.setIndex(1);
+    let resolvePlan!: (value: ListeningPlanResponse) => void;
+    h.requestPlan.mockImplementationOnce(() => new Promise((resolve) => {
+      resolvePlan = resolve;
+    }));
+    const pending = h.controller.ensureRunway();
+    // Another path fills the lane before the answer lands.
+    h.applyPlan('auto_mode', response('auto_mode', 2), false);
+    resolvePlan(response('auto_mode', 1));
+    await expect(pending).resolves.toBe(true);
+
+    expect(h.requestPlan).toHaveBeenCalledTimes(2);
+    expect(h.applyPlan).toHaveBeenCalledTimes(applied + 1);
     h.controller.stop();
   });
 
@@ -159,6 +193,9 @@ describe('GeneratedQueueController', () => {
   it('replaces the Auto Mode tail immediately when its profile changes', async () => {
     const h = harness();
     await h.controller.start('auto_mode', seed);
+    // A populated lane never refreshes, however it is asked: consume one so
+    // there is a deficit to rewrite.
+    h.setIndex(1);
 
     await h.controller.replan('familiar');
 
@@ -199,6 +236,8 @@ describe('GeneratedQueueController', () => {
   it('keeps one stateless session lineage and advances only accepted segments', async () => {
     const h = harness();
     await h.controller.start('auto_mode', seed);
+    // Ditto: refreshes only fire into a deficit.
+    h.setIndex(1);
     const firstSession = h.requestPlan.mock.calls[0][6]!;
 
     h.applyPlan.mockReturnValueOnce(0);
