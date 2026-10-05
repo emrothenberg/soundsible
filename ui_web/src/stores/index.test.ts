@@ -2039,6 +2039,22 @@ describe('Auto Mode store contract', () => {
     actions.exitAutoMode();
   });
 
+  it('does not refresh a populated lane on Retry', async () => {
+    const planDjQueue = vi.fn().mockResolvedValue(autoPlan(Array.from({ length: 8 }, (_, index) => `route-${index}`)));
+    const { actions, state } = await loadStore({ planDjQueue });
+    actions.playFrom([t1], 0);
+    actions.enterAutoMode();
+    await vi.waitFor(() => expect(state.playback.queue.length).toBe(9));
+    const routeBefore = state.playback.queue.map((row) => row.queueId);
+
+    actions.retryAutoRoute();
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(planDjQueue).toHaveBeenCalledTimes(1);
+    expect(state.playback.queue.map((row) => row.queueId)).toEqual(routeBefore);
+    actions.exitAutoMode();
+  });
+
   it('refreshes the whole runway only on explicit Retry', async () => {
     const planDjQueue = vi.fn()
       .mockResolvedValueOnce(autoPlan(['old-1', 'old-2']))

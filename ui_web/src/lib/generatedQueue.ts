@@ -213,7 +213,7 @@ export class GeneratedQueueController {
       id: intent === 'auto_mode' ? sessionId() : undefined,
       segmentIndex: 0,
     };
-    return this.sync(true);
+    return this.sync();
   }
 
   /** Adopt a route the server already planned while choosing an opening.
@@ -239,7 +239,7 @@ export class GeneratedQueueController {
     this.deps.onStatus(intent, 'ready');
   }
 
-  ensureAutoplay(seed: Track, force = false): Promise<boolean> {
+  ensureAutoplay(seed: Track): Promise<boolean> {
     if (this.session && this.session.intent !== 'autoplay') return Promise.resolve(false);
     if (!this.session) {
       this.session = {
@@ -252,7 +252,7 @@ export class GeneratedQueueController {
     } else {
       this.session.seed = seed;
     }
-    return this.sync(force);
+    return this.sync();
   }
 
   stop(intent?: ListeningPlanIntent): void {
@@ -289,7 +289,7 @@ export class GeneratedQueueController {
     this.settledInput = null;
     this.aborter?.abort();
     this.inFlight = null;
-    return this.sync(true, true);
+    return this.sync(true);
   }
 
   rememberCurrent(): void {
@@ -318,7 +318,7 @@ export class GeneratedQueueController {
 
   async refillNow(): Promise<boolean> {
     this.rememberCurrent();
-    return this.sync(true);
+    return this.sync();
   }
 
   /**
@@ -366,7 +366,7 @@ export class GeneratedQueueController {
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       this.settledInput = null;
-      void this.sync(true);
+      void this.sync();
     }, delay);
   }
 
@@ -423,12 +423,15 @@ export class GeneratedQueueController {
     return [...values];
   }
 
-  private sync(force = false, replace = false): Promise<boolean> {
+  private sync(replace = false): Promise<boolean> {
     const session = this.session;
     if (!session) return Promise.resolve(false);
     if (this.inFlight) return this.inFlight;
     const remaining = this.generatedRemaining(session.intent);
-    if (!force && remaining >= REFILL_THRESHOLD[session.intent]) {
+    // Populated lane: no refresh fires, however the sync was asked for. Forced
+    // refills, explicit refreshes and late retries all converge here — firing
+    // a plan while the settled length is already queued only churns the lane.
+    if (remaining >= REFILL_THRESHOLD[session.intent]) {
       if (session.intent === 'auto_mode') {
         this.deps.onStatus(session.intent, 'ready');
       }
@@ -466,6 +469,14 @@ export class GeneratedQueueController {
         : undefined,
     ).then((response) => {
       if (generation !== this.generation || aborter.signal.aborted || this.session !== session) return false;
+      // Late answer: the lane filled while this request was in flight (an
+      // advance top-up, the settle-delayed refill, a repair landing first).
+      // Populating now would overshoot the settled length, so the response is
+      // dropped and the lane left exactly as it is.
+      if (!replace && this.generatedRemaining(session.intent) >= TARGET_LOOKAHEAD) {
+        this.deps.onStatus(session.intent, 'ready', response, replace);
+        return true;
+      }
       const accepted = this.deps.applyPlan(session.intent, response, replace, seed);
       if (accepted === 0) {
         const exhausted = session.intent === 'auto_mode'

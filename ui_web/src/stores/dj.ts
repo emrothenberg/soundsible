@@ -94,7 +94,7 @@ export function createDj(ports: DjPorts, lifetime: RuntimeLifetime) {
     // A context song still waiting on its match has nothing to seed a plan with.
     const seed = generated.at(-1) ?? deterministic.filter(entry => !isPendingEntry(entry)).at(-1) ?? current;
     if (generated.length >= AUTOPLAY_TARGET) return true;
-    return ensureGeneratedQueue().ensureAutoplay(seed, force);
+    return ensureGeneratedQueue().ensureAutoplay(seed);
   }
   const COMMIT_LEAD_SECONDS = 45;
   const MIN_PLAY_SECONDS = 90;
