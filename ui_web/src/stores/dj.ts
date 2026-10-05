@@ -701,7 +701,7 @@ export function createDj(ports: DjPorts, lifetime: RuntimeLifetime) {
       return;
     }
   }
-  function dropAutoRouteOccurrence(queueId: string): PlaybackQueueEntry | null {
+  function dropAutoRouteOccurrence(queueId: string, scheduleRefill = true): PlaybackQueueEntry | null {
     if (!state.autoMode.active || committedTransition?.queueId === queueId) return null;
     const track = state.playback.queue.find(entry => entry.queueId === queueId);
     if (!track) return null;
@@ -711,9 +711,10 @@ export function createDj(ports: DjPorts, lifetime: RuntimeLifetime) {
     setState('autoMode', 'plan', plan => Object.fromEntries(Object.entries(plan).filter(([id]) => !owned.has(id))));
     setState('autoMode', 'staleSeams', seams => seams.filter(id => !owned.has(id)));
     ports.updateUpcomingPreparation();
-    // No refill here: the deficit heals append-only on the next advance (or
-    // via the empty-lane safety nets). Fetching mid-gesture rewrites the lane
-    // under repairs and can resurrect the song just removed.
+    // The deficit heals append-only at the bottom of the lane after a short
+    // settle delay — never mid-gesture, where it would rewrite the lane under
+    // repairs or resurrect the song just removed. An advance heals it sooner.
+    if (scheduleRefill) generatedQueue?.refillDebounced();
     return track;
   }
   function avoidAutoIdentity(track: Track): void {
@@ -989,7 +990,8 @@ export function createDj(ports: DjPorts, lifetime: RuntimeLifetime) {
       for (const entry of matching) generatedQueue?.exclude(entry);
       if (state.autoMode.active) {
         for (const entry of matching) {
-          if (entry.queueLane === 'generated') dropAutoRouteOccurrence(entry.queueId);
+          // Dead media refills immediately below; no settle-delayed top-up.
+          if (entry.queueLane === 'generated') dropAutoRouteOccurrence(entry.queueId, false);
         }
       }
       // Auto's route helper may already have removed generated entries and their

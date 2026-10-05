@@ -2012,6 +2012,33 @@ describe('Auto Mode store contract', () => {
     expect(planDjQueue).toHaveBeenCalledTimes(2);
   });
 
+  it('refills a removed song after a short delay, appended at the bottom', async () => {
+    let n = 0;
+    const planDjQueue = vi.fn().mockImplementation(async (body: { limit?: number }) => autoPlan(
+      Array.from({ length: body.limit ?? 8 }, () => `fill-${n++}`),
+    ));
+    const { actions, state } = await loadStore({ planDjQueue });
+    actions.playFrom([t1], 0);
+    actions.enterAutoMode();
+    await vi.waitFor(() => expect(state.playback.queue.length).toBe(9));
+
+    actions.removeAutoRouteOccurrence(state.playback.queue[3].queueId);
+
+    expect(state.playback.queue).toHaveLength(8);
+    expect(planDjQueue).toHaveBeenCalledTimes(1);
+    // Settles first: no refill inside the delay.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    expect(planDjQueue).toHaveBeenCalledTimes(1);
+    // Then exactly one top-up, appended at the bottom, order preserved.
+    await vi.waitFor(() => expect(planDjQueue).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    expect(planDjQueue.mock.calls[1][0]).toMatchObject({ limit: 1 });
+    await vi.waitFor(() => expect(state.playback.queue.length).toBe(9));
+    expect(state.playback.queue.map((row) => row.id)).toEqual(
+      ['t1', 'fill-0', 'fill-1', 'fill-3', 'fill-4', 'fill-5', 'fill-6', 'fill-7', 'fill-8'],
+    );
+    actions.exitAutoMode();
+  });
+
   it('refreshes the whole runway only on explicit Retry', async () => {
     const planDjQueue = vi.fn()
       .mockResolvedValueOnce(autoPlan(['old-1', 'old-2']))
