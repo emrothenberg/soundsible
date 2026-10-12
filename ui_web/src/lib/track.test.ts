@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isPodcastTrack, isMusicTrack, podcastEpisodeToTrack } from './track';
+import { downloadEvidence, isPodcastTrack, isMusicTrack, podcastEpisodeToTrack } from './track';
 import type { Track } from '../types/music';
 import type { PodcastEpisode } from '../types/podcast';
 
@@ -63,5 +63,27 @@ describe('podcastEpisodeToTrack', () => {
     expect(t.id).toBe(noGuid.enclosure_url);
     expect(t.podcast_episode_guid).toBe(noGuid.enclosure_url);
     expect(isPodcastTrack(t)).toBe(true);
+  });
+});
+
+describe('downloadEvidence', () => {
+  const preview: Track = { id: 'AbCdEfGhIjK', title: 'Song', artist: 'Artist', source: 'preview' };
+
+  it('names the release a catalog song was chosen from', () => {
+    expect(downloadEvidence({ ...preview, album: ' Album ', album_artist: 'Artist', musicbrainz_id: 'mbid' }))
+      .toEqual({ album: 'Album', album_artist: 'Artist', musicbrainz_id: 'mbid' });
+  });
+
+  it('files the song where it sits on the record, and never under an upload date', () => {
+    expect(downloadEvidence({ ...preview, album: 'Album', track_number: 3, disc_number: 2, year: 2010 }))
+      .toEqual({ album: 'Album', track_number: 3, disc_number: 2, year: 2010 });
+    // A video's upload date read as a year, and positions that are not ones.
+    expect(downloadEvidence({ ...preview, album: 'Album', track_number: 0, disc_number: 1.5, year: 20101012 }))
+      .toEqual({ album: 'Album' });
+  });
+
+  it('sends nothing when the preview names no album', () => {
+    expect(downloadEvidence(preview)).toBeNull();
+    expect(downloadEvidence({ ...preview, album: '  ', album_artist: 'Artist' })).toBeNull();
   });
 });

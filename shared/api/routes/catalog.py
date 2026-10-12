@@ -28,7 +28,7 @@ from shared.musicbrainz import normalize_recording_mbid
 from shared.music_identity import youtube_music_metadata
 from shared.providers import deezer
 from shared.hardening import SCOPE_LIBRARY_WRITE, rate_limit, require_scope
-from shared.resolution_confidence import best_candidate, classify_confidence
+from shared.resolution_confidence import best_candidate, classify_confidence, rerank_cached_resolution
 from shared.text_utils import (
     collapse_text,
     fold_text,
@@ -1261,12 +1261,33 @@ def _resolve_candidates(artist: str, title: str, duration_s: int | None = None) 
     their own.
     """
     db = instance_db()
-    cached = db.get_cached_resolution(artist, title)
+    cached = cached_resolution(db, artist, title, duration_s)
     if cached and cached.get("id"):
         return cached, cached.get("candidates") or [cached]
 
     key = f"{_norm(artist)}|{_norm(title)}|{duration_s or ''}"
     return _resolve_memo.resolve(key, lambda: _resolve_candidates_uncached(artist, title, duration_s))
+
+
+def cached_resolution(db: DatabaseManager, artist: str, title: str, duration_s: int | None) -> dict[str, Any] | None:
+    """The stored resolution for a song, re-ranked for this caller's running time.
+
+    See `rerank_cached_resolution`. A row resolved without a running time is
+    corrected for everyone, so callers that know none stop getting the answer
+    that ignored one. A row resolved for a running time keeps it: another time
+    is another cut of the same title — a radio edit, a stale client — and gets
+    its own answer without overwriting the one stored.
+    """
+    cached = db.get_cached_resolution(artist, title)
+    if not cached:
+        return None
+    reranked = rerank_cached_resolution(artist, title, duration_s, cached)
+    if not reranked:
+        return cached
+    if cached.get("requested_duration"):
+        return {**cached, **reranked}
+    db.set_cached_resolution(artist, title, {**reranked, "requested_duration": duration_s})
+    return db.get_cached_resolution(artist, title) or cached
 
 
 def _resolve_candidates_uncached(
@@ -1293,6 +1314,7 @@ def _resolve_candidates_uncached(
             "confidence": score,
             "confidence_reason": reason,
             "candidates": ranked,
+            "requested_duration": duration_s,
         },
     )
 
@@ -1569,6 +1591,16 @@ def _deezer_track_to_catalog_item(row: dict[str, Any], library_keys: set[str] | 
         position = _positive_int(row.get(field), 999)
         if position:
             raw[key] = position
+    # And when the record came out and whose record it is, where the row was
+    # listed from one (an album page or a discography). A search row's album
+    # names neither, and a download keeps none rather than the upload's.
+    year = _extract_year(album_row.get("release_date"))
+    if year and 1000 <= year <= 9999:
+        raw["year"] = year
+    album_artist_row = album_row.get("artist") if isinstance(album_row.get("artist"), dict) else {}
+    album_artist = _clean(album_artist_row.get("name"))
+    if album_artist:
+        raw["album_artist"] = album_artist
     return _catalog_item(
         item_id=f"deezer:track:{deezer_id}",
         item_type="track",
@@ -1708,11 +1740,15 @@ def _deezer_album_profile(album_id: str, library_keys: set[str] | None = None) -
         "cover_xl": data.get("cover_xl"),
         "cover_big": data.get("cover_big"),
         "cover_medium": data.get("cover_medium"),
+        "release_date": data.get("release_date"),
+        "artist": artist_row,
     }
     tracklist: list[dict[str, Any]] = []
     for row in _deezer_album_tracks(album_id, embedded):
-        if not isinstance(row.get("album"), dict):
-            row = {**row, "album": this_album}
+        # A row's own album fields win; this record fills what it leaves out,
+        # including the release date its listing never carries.
+        own = row.get("album") if isinstance(row.get("album"), dict) else {}
+        row = {**row, "album": {**this_album, **{k: v for k, v in own.items() if v not in (None, "")}}}
         item = _deezer_track_to_catalog_item(row, library_keys)
         if item:
             tracklist.append(item)
@@ -1793,7 +1829,15 @@ def _deezer_artist_discography(artist_id: str) -> dict[str, Any]:
         if not rows:
             failures.append(release["title"])
             continue
-        this_release = {"id": release["deezer_id"], "title": release["title"], "cover_xl": release["cover"]}
+        this_release = {
+            "id": release["deezer_id"],
+            "title": release["title"],
+            "cover_xl": release["cover"],
+            "release_date": release.get("year"),
+            # The discography is this artist's own records: albums, singles
+            # and EPs, never a compilation.
+            "artist": {"name": name},
+        }
         songs: list[dict[str, Any]] = []
         for row in rows:
             item = _deezer_track_to_catalog_item({**row, "album": this_release})
@@ -1990,27 +2034,43 @@ def _library_album_keys(album_name: str, artist: str) -> set[str]:
 
 
 def _resolve_album_deezer_id(name: str, artist: str) -> str | None:
-    """Search Deezer for an album by name + artist, return best match deezer_id."""
-    q = f'album:"{name}" artist:"{artist}"' if artist else f'album:"{name}"'
-    data = _deezer_get("search", {"q": q, "limit": 5})
-    rows = data.get("data") if isinstance(data.get("data"), list) else []
-    name_folded = fold_text(name)
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        album_row = row.get("album") if isinstance(row.get("album"), dict) else {}
-        album_title = _clean(album_row.get("title"))
-        album_id = str(album_row.get("id") or "")
-        if album_id and fold_text(album_title) == name_folded:
-            return album_id
-    # Fuzzy: first result with an album id
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        album_row = row.get("album") if isinstance(row.get("album"), dict) else {}
-        album_id = str(album_row.get("id") or "")
-        if album_id:
-            return album_id
+    """Search Deezer for an album by name + artist, return best match deezer_id.
+
+    A plain album search: Deezer's field syntax (`album:"…" artist:"…"`)
+    stopped answering in October 2026 and returned nothing, so every album
+    looked up by name came back unresolved.
+    """
+    data = _deezer_get("search/album", {"q": f"{name} {artist}".strip(), "limit": 10})
+    rows = [row for row in (data.get("data") if isinstance(data.get("data"), list) else []) if isinstance(row, dict)]
+    name_folded, artist_folded = fold_text(name), fold_text(artist)
+
+    def album_id(row: dict) -> str:
+        return str(row.get("id") or "")
+
+    def title_matches(row: dict) -> bool:
+        return fold_text(_clean(row.get("title"))) == name_folded
+
+    def edition_of(row: dict) -> bool:
+        # "Abbey Road (Remastered 2009)" is still Abbey Road.
+        bare = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", _clean(row.get("title")))
+        return fold_text(bare) == name_folded
+
+    def artist_matches(row: dict) -> bool:
+        artist_row = row.get("artist") if isinstance(row.get("artist"), dict) else {}
+        return not artist_folded or fold_text(_clean(artist_row.get("name"))) == artist_folded
+
+    # The artist asked for outranks a title: another artist's exact title is
+    # a cover or a tribute, the artist's own edition is the record.
+    for wanted in (
+        lambda row: title_matches(row) and artist_matches(row),
+        lambda row: edition_of(row) and artist_matches(row),
+        artist_matches,
+        title_matches,
+        lambda row: True,
+    ):
+        for row in rows:
+            if album_id(row) and wanted(row):
+                return album_id(row)
     return None
 
 

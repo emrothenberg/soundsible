@@ -5,22 +5,27 @@ name: Release
 # turns them into a single GitHub Release. Before this, engine tags published
 # images and no release page, desktop tags published draft releases nobody
 # ever pressed publish on, and the two lines used different numbers.
+#
+# `workflow_dispatch` is how `release-tag.yml` starts it: that workflow tags the
+# merged version bump with `GITHUB_TOKEN`, whose pushes start nothing. A
+# dispatch on anything but the matching tag fails `verify`.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # Ninety minutes of Windows and Linux builds are not worth spending on a tag
+  # An hour and a half of Windows, Android and iPhone builds is not worth spending on a tag
   # that contradicts the tree it points at. CI checks this too; here it is a
   # precondition rather than a report.
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
       - name: Tag matches the declared version
@@ -40,6 +45,19 @@ jobs:
       attestations: write
     uses: ./.github/workflows/desktop-build.yml
 
+  # The signed Android alpha. It builds, installs over the previous published
+  # APK on an emulator, and waits for this commit's own CI before handing the
+  # APK over, so it is the slowest job here. Its signing secrets live in the
+  # `android-release` environment, which admits main and `v*` tags only.
+  android:
+    needs: verify
+    permissions:
+      contents: read
+      checks: read
+      actions: write
+    uses: ./.github/workflows/android-release.yml
+    secrets: inherit
+
   # The iPhone app is not on the App Store — guideline 5.2.3 forbids downloading
   # media from YouTube — so a release *is* its distribution channel. The IPA and
   # the AltStore source that points at it ship with every tag.
@@ -54,8 +72,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: soundsible-ios-ipa
           path: ios-artifact
@@ -73,22 +91,26 @@ jobs:
             --out apps.json
           cat apps.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: soundsible-altstore-source
           path: apps.json
           if-no-files-found: error
 
   publish:
-    needs: [installers, altstore_source]
+    needs: [installers, altstore_source, android]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      # Only what is meant to be downloaded. The builds also upload test
+      # evidence, and `files: artifacts/**` would attach anything that landed
+      # here to the release.
+      - uses: actions/download-artifact@v8.0.2
         with:
           path: artifacts
+          pattern: soundsible-*
           merge-multiple: true
 
       # Image tags carry no `v`; the git tag does. Quoting the wrong one in
@@ -106,7 +128,7 @@ jobs:
       # pre-release, so the channel is visible in the number itself and cannot
       # be set to one thing and named another.
       - name: Publish the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           name: Soundsible ${{ github.ref_name }}
           files: artifacts/**
@@ -138,8 +160,16 @@ jobs:
             docker pull ${{ steps.image.outputs.name }}:${{ steps.image.outputs.tag }}
             ```
 
-            **Desktop app (beta)** — one machine, no terminal. Installers for
-            Linux and Windows are attached below.
+            **Windows desktop app (beta)** — one machine, no terminal: the
+            installers attached below run a station on this PC and its player.
+            On Linux, run the station natively or with Docker and open the
+            player in Chrome or Firefox, where it installs as an app.
+
+            **Android (alpha)** — `Soundsible-Android-alpha.apk` is attached;
+            check it against `SHA256SUMS-android.txt`. Install it over an
+            earlier alpha to keep your account and offline copies:
+            [Android alpha](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/android/ALPHA.md).
+            `upgrade-seed-androidTest.apk` is test evidence, not an app.
 
             **iPhone and iPad** — `Soundsible.ipa` is attached. Soundsible is
             not on the App Store, so it installs through

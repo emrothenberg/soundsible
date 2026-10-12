@@ -16,6 +16,7 @@ import re
 import requests
 from flask import Response, jsonify, request
 
+from shared.podcast_regions import valid_podcast_country
 from shared.hardening import rate_limit
 from shared.providers import deezer
 from shared.discovery_intelligence import (
@@ -93,11 +94,13 @@ def discovery_settings_patch():
         return jsonify({"error": "volume_leveling must be boolean"}), 400
     if "dj_mixing" in data and not isinstance(data.get("dj_mixing"), bool):
         return jsonify({"error": "dj_mixing must be boolean"}), 400
+    if "podcast_country" in data and not valid_podcast_country(data["podcast_country"]):
+        return jsonify({"error": "Unsupported podcast country"}), 400
     saved = save_discovery_settings(data)
     # Volume levelling and DJ mixing have nothing to do with what gets
     # recommended, so a patch that only touches them must not throw away a warm
     # personalized feed.
-    if set(data) - {"volume_leveling", "dj_mixing"}:
+    if set(data) - {"volume_leveling", "dj_mixing", "podcast_country"}:
         _invalidate_personalized_cache()
     return jsonify(saved)
 
@@ -169,6 +172,7 @@ def discovery_save():
       {status: "needs_review", confidence, confidence_level, candidates: [...]}
       {status: "failed",       reason, candidates: [...]}
     """
+    from shared.api.routes.catalog import cached_resolution
     from shared.resolution_confidence import best_candidate, classify_confidence
     from shared.database import instance_db
 
@@ -200,7 +204,7 @@ def discovery_save():
 
     # — Check resolution cache —
     db = instance_db()
-    cached = db.get_cached_resolution(artist, title)
+    cached = cached_resolution(db, artist, title, duration_s)
     if cached and cached.get("confidence") is not None:
         score = cached["confidence"]
         level = classify_confidence(score)
@@ -247,6 +251,7 @@ def discovery_save():
         "confidence": score,
         "confidence_reason": reason,
         "candidates": ranked,
+        "requested_duration": duration_s,
     })
 
     level = classify_confidence(score)

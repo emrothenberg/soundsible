@@ -17,6 +17,8 @@ export interface Track {
   artists?: string[] | null;
   album?: string;
   album_artist?: string | null;
+  /** Where the song sits on its record. */
+  track_number?: number | null;
   disc_number?: number | null;
   disc_total?: number | null;
   is_compilation?: boolean;
@@ -81,6 +83,12 @@ export interface SavedEntry {
   title?: string;
   artist?: string;
   album?: string;
+  /** The record the song is on, and its place there: what a download of a
+   * saved song that is not a file yet is filed under. */
+  album_artist?: string;
+  track_number?: number;
+  disc_number?: number;
+  year?: number;
   duration?: number;
   thumbnail?: string;
   favourite?: boolean;
@@ -106,7 +114,13 @@ export interface LyricsResponse {
   instrumental: boolean;
   cached: boolean;
   pending?: boolean;
+  /** The timed lines can be followed as they are: the upload's timeline is the
+   * album's, and the recording is as long as the one they were timed for. */
   timing_safe?: boolean;
+  /** Seconds of the recording the timed lines were written against. */
+  synced_duration?: number | null;
+  /** A listener's correction: the lines sit this much later in this audio. */
+  offset_ms?: number | null;
 }
 
 export interface SearchResult {
@@ -199,6 +213,7 @@ export interface CatalogSaveResponse {
 export type PlaylistMap = Record<string, string[]>;
 
 export interface LibrarySettings {
+  playlist_order?: string[];
   playlist_covers?: Record<string, string>;
 }
 

@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createSignal } from 'solid-js';
 import { CoverImage } from './CoverImage';
 import { artworkCandidates, coverUrl, registerArtworkMetadata, trackCoverUrl } from '../lib/media';
-vi.mock('../lib/config', () => ({ apiOrigin: () => '' }));
+vi.mock('../lib/config', () => ({ apiOrigin: () => '', mediaOrigin: () => '', artworkUrl: (url?: string | null) => url || undefined }));
 
 describe('responsive artwork', () => {
   it('offers density variants and caps at real cropped resolution', () => {
@@ -44,4 +44,19 @@ describe('responsive artwork', () => {
     expect(container.querySelector('img')!.getAttribute('srcset')).toBeNull();
     expect(container.querySelector('img')!.getAttribute('loading')).toBe('lazy');
   });
+});
+
+it('reuses the immediate decoding path only for previously painted artwork', () => {
+  const first = render(() => <div><CoverImage src="/warm-session-artwork.jpg" /></div>);
+  const image = first.container.querySelector('img')!;
+  expect(image).toHaveAttribute('loading', 'lazy');
+  fireEvent.load(image);
+  first.unmount();
+  const [src, setSrc] = createSignal('/warm-session-artwork.jpg');
+  const second = render(() => <div><CoverImage src={src()} /></div>);
+  expect(second.container.querySelector('img')).toHaveAttribute('loading', 'eager');
+  expect(second.container.querySelector('img')).toHaveAttribute('decoding', 'sync');
+  setSrc('/unseen-session-artwork.jpg');
+  expect(second.container.querySelector('img')).toHaveAttribute('loading', 'lazy');
+  expect(second.container.querySelector('img')).toHaveAttribute('decoding', 'async');
 });

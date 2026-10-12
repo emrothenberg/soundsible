@@ -1,3 +1,4 @@
+import { desktopBridge } from '../lib/desktopBridge';
 /**
  * Appearance: the stored preference, what it resolves to, and keeping the
  * document in sync with the OS while it is `system`.
@@ -76,7 +77,15 @@ let themeTransitionTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Paint the resolved theme and the mobile status-bar colour. `animate` arms the
  * `[data-theme-transition]` cross-fade in tokens.css; the boot paint leaves it off
- * so the first frame is never animated. */
+ * so the first frame is never animated.
+ *
+ * Known iOS limit: after a theme change, the edge-swipe back gesture still
+ * previews earlier pages in the old palette until the finger lifts. That
+ * preview is not this document: WebKit screenshots each history entry as it is
+ * left (WebBackForwardList → recordAutomaticNavigationSnapshot) and
+ * ViewGestureControllerIOS shows that image during the swipe. No page API can
+ * refresh or drop it. The only escapes are re-visiting every earlier page or
+ * replacing browser history with in-app navigation; neither is worth it. */
 function applyResolvedTheme(resolved: ResolvedTheme, animate = false): void {
   if (typeof document === 'undefined') return;
   const root = document.documentElement;
@@ -113,6 +122,8 @@ function applyResolvedTheme(resolved: ResolvedTheme, animate = false): void {
  * splash screen, not a reason to refuse the theme the listener just chose.
  */
 export function announceTheme(theme: Theme): void {
+  const bridge = desktopBridge();
+  if (bridge) { void bridge.appearance(theme, THEME_COLORS).catch(() => {}); return; }
   if (!ownerToken()) return;
   void api.setDesktopAppearance(theme, THEME_COLORS).catch(() => {});
 }

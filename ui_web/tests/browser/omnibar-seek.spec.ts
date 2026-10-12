@@ -37,11 +37,15 @@ test('seek is keyboard accessible and leaves transport targets clear at every de
   await expect.poll(async () => Number(await seek.inputValue())).toBeGreaterThanOrEqual(1);
   for (const size of ['compact', 'normal', 'large']) {
     await page.evaluate(size => { document.documentElement.dataset.interfaceSize = size; }, size);
-    const bounds = (await seek.boundingBox())!;
-    for (const button of await pill.getByRole('button').all()) {
-      const box = await button.boundingBox();
-      if (box) expect(box.y).toBeGreaterThanOrEqual(bounds.y + bounds.height);
-    }
+    // Density changes reflow the rail and controls together. Sample them in
+    // one layout, and wait for that reflow rather than mixing two frames.
+    await expect.poll(() => pill.evaluate(node => {
+      const bounds = node.querySelector('[data-omni-seek] input')!.getBoundingClientRect();
+      return [...node.querySelectorAll('button')].every(button => {
+        const box = button.getBoundingClientRect();
+        return !box.width || !box.height || box.top >= bounds.bottom;
+      });
+    })).toBe(true);
   }
   expect((await new AxeBuilder({ page }).include('[data-omni-player]').analyze()).violations).toEqual([]);
   await expect(page.locator('[data-player-surface-open]')).toHaveCount(0);
@@ -122,13 +126,14 @@ test('small and landscape viewports retain separate seek and button hit areas', 
     await page.setViewportSize(viewport);
     for (const size of ['compact', 'normal', 'large']) {
       await page.evaluate(size => { document.documentElement.dataset.interfaceSize = size; }, size);
-      const seek = (await page.locator('[data-omni-seek] input').boundingBox())!;
-      expect(seek.x).toBeGreaterThanOrEqual(0);
-      expect(seek.x + seek.width).toBeLessThanOrEqual(viewport.width);
-      for (const button of await page.locator('[data-omni-player]').getByRole('button').all()) {
-        const box = await button.boundingBox();
-        if (box) expect(box.y).toBeGreaterThanOrEqual(seek.y + seek.height);
-      }
+      // Resize and density changes can settle between separate boundingBox
+      // calls. Read every rectangle in one frame, then wait for the layout.
+      await expect.poll(() => page.locator('[data-omni-player]').evaluate((player) => {
+        const seek = player.querySelector('[data-omni-seek] input')!.getBoundingClientRect();
+        const buttons = [...player.querySelectorAll('button')].filter(button => button.getClientRects().length);
+        return seek.left >= 0 && seek.right <= window.innerWidth
+          && buttons.every(button => button.getBoundingClientRect().top >= seek.bottom);
+      })).toBe(true);
     }
   }
 });

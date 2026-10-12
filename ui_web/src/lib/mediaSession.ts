@@ -8,6 +8,7 @@ export type MediaSessionSyncReason =
   | 'playing'
   | 'paused'
   | 'position'
+  | 'seeked'
   | 'handoff_dominant'
   | 'handoff_settled'
   | 'visibility_resume'
@@ -65,6 +66,10 @@ export class ProgramMediaSession {
   }
 
   uninstallActions(): void {
+    this.clearBrowserActions();
+  }
+
+  private clearBrowserActions(): void {
     if (!hasMediaSession()) return;
     const session = navigator.mediaSession;
     for (const action of ['play', 'pause', 'nexttrack', 'previoustrack', 'seekto', 'seekbackward', 'seekforward'] as MediaSessionAction[]) {

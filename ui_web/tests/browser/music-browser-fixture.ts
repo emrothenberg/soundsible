@@ -1,4 +1,5 @@
-import { expect, type Page } from '@playwright/test';
+import type { PlaybackContextDescriptor } from '../../src/lib/playbackQueue';
+import { expect, type Page, type BrowserContext } from '@playwright/test';
 
 export const TRACKS = Array.from({ length: 320 }, (_, index) => ({
   id: `library-track-${index + 1}`,
@@ -8,7 +9,7 @@ export const TRACKS = Array.from({ length: 320 }, (_, index) => ({
   duration: 180,
 }));
 
-export async function mockMusicEngine(page: Page) {
+export async function mockMusicEngine(page: Page | BrowserContext) {
   await page.routeWebSocket('**/socket.io/**', (socket) => socket.close());
   await page.route('**/socket.io/**', (route) => route.abort());
   await page.route('**/api/**', async (route) => {
@@ -27,6 +28,8 @@ export async function mockMusicEngine(page: Page) {
       body = [];
     } else if (path === '/api/downloader/queue') {
       body = { queue: [], is_processing: false, logs: [] };
+    } else if (path === '/api/discovery/podcasts/countries') {
+      body = { countries: ['es', 'mx', 'us'] };
     } else if (path === '/api/discovery/settings') {
       body = { learning_enabled: true, autoplay_enabled: false };
     } else if (path === '/api/downloader/config') {
@@ -86,7 +89,7 @@ export const silentWav = (() => {
   return wav;
 })();
 
-export async function silentStream(page: Page): Promise<void> {
+export async function silentStream(page: Page | BrowserContext): Promise<void> {
   await page.route('**/api/static/stream/**', (route) => route.fulfill({ contentType: 'audio/wav', body: silentWav }));
 }
 
@@ -120,11 +123,11 @@ type FixtureTrack = (typeof TRACKS)[number];
  */
 export async function restoreQueueSession(
   page: Page,
-  opts: { current: FixtureTrack; requests: FixtureTrack[]; context?: FixtureTrack[] },
+  opts: { current: FixtureTrack; requests: FixtureTrack[]; context?: FixtureTrack[]; descriptor?: PlaybackContextDescriptor },
 ): Promise<void> {
-  const library = { id: 'library', kind: 'library', label: 'Tu biblioteca', destination: '/' };
+  const library = opts.descriptor ?? { id: 'library', kind: 'library', label: 'Tu biblioteca', destination: '/' };
   const contextEntry = (track: FixtureTrack, index: number) => ({
-    ...track, queueId: `q-context-${track.id}`, queueLane: 'context', queueSource: 'library',
+    ...track, queueId: `q-context-${track.id}`, queueLane: 'context', queueSource: library.kind,
     queueContext: library, queueContextIndex: index,
   });
   const queue = [

@@ -1,3 +1,5 @@
+mod client;
+mod desktop;
 mod engine;
 mod pairing;
 mod state;
@@ -57,7 +59,7 @@ fn parse_hex_color(value: &str) -> Option<Color> {
 /// every navigation between the shell and the player.
 fn apply_window_appearance(app: &AppHandle) {
     let appearance = state::load_appearance(os_prefers_dark(app));
-    if let Some(window) = app.get_webview_window("main") {
+    for window in app.webview_windows().into_values() {
         if let Some(color) = appearance.color.as_deref().and_then(parse_hex_color) {
             let _ = window.set_background_color(Some(color));
         }
@@ -86,11 +88,26 @@ fn get_startup_profile(state: State<'_, AppState>) -> state::StartupProfile {
                 false
             }
         });
-    state::startup_profile(skip)
+    let mut profile = state::startup_profile(skip);
+    profile.mode = match client::load().mode {
+        client::ConnectionMode::Choose => "choose",
+        client::ConnectionMode::Local => "local",
+        client::ConnectionMode::Server => "server",
+    }
+    .into();
+    profile.server = client::load().server;
+    if profile.mode != "local" {
+        profile.auto_start = false;
+    }
+    profile
 }
 
 #[tauri::command]
 fn stop_engine(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if client::is_server() {
+        return Err("The desktop does not manage this server.".into());
+    }
+    desktop::close_player(&app);
     state.engine.stop(Some(&app))?;
     if let Ok(mut skip) = state.skip_autostart_once.lock() {
         *skip = true;
@@ -99,7 +116,7 @@ fn stop_engine(app: AppHandle, state: State<'_, AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+async fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     if enabled {
         app.autolaunch().enable().map_err(|e| e.to_string())
@@ -125,6 +142,11 @@ fn start_configured_engine(app: AppHandle, state: State<'_, AppState>) -> Result
     if let Ok(mut slot) = state.selected_folder.lock() {
         *slot = Some(music_dir.clone());
     }
+    client::save(&client::Preferences {
+        mode: client::ConnectionMode::Local,
+        server: client::load().server,
+    })?;
+    tray::refresh_mode(&app);
     state.engine.start(app, music_dir)
 }
 
@@ -265,6 +287,11 @@ fn start_engine(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
         .map_err(|_| "State lock poisoned".to_string())?
         .clone()
         .ok_or_else(|| "Choose a music folder first.".to_string())?;
+    client::save(&client::Preferences {
+        mode: client::ConnectionMode::Local,
+        server: client::load().server,
+    })?;
+    tray::refresh_mode(&app);
     state.engine.start(app, music_dir)
 }
 
@@ -277,11 +304,19 @@ fn start_engine_with_path(
     if let Ok(mut slot) = state.selected_folder.lock() {
         *slot = Some(PathBuf::from(&path));
     }
+    client::save(&client::Preferences {
+        mode: client::ConnectionMode::Local,
+        server: client::load().server,
+    })?;
+    tray::refresh_mode(&app);
     state.engine.start(app, PathBuf::from(path))
 }
 
 #[tauri::command]
 fn restart_engine(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if client::is_server() {
+        return Err("The desktop does not manage this server.".into());
+    }
     state.engine.restart(app)
 }
 
@@ -303,7 +338,6 @@ fn open_pairing(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
     return_to_shell(&app)?;
     app.emit("shell-view", "pairing")
         .map_err(|e| e.to_string())?;
-    tray::focus_main_window(&app);
     Ok(())
 }
 
@@ -318,21 +352,51 @@ fn open_player(app: AppHandle, state: State<'_, AppState>) -> Result<(), String>
 }
 
 pub fn return_to_shell(app: &AppHandle) -> Result<(), String> {
+    tray::hide_player(app);
     let window = app
         .get_webview_window("main")
-        .ok_or_else(|| "Main window not found".to_string())?;
-    let url: url::Url = "tauri://localhost/index.html"
-        .parse()
-        .map_err(|e: url::ParseError| e.to_string())?;
-    window.navigate(url).map_err(|e| e.to_string())
+        .ok_or("Main window not found")?;
+    window.show().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())
 }
 
 fn navigate_main_window(app: &AppHandle, url: &str) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window not found".to_string())?;
-    let parsed = url.parse().map_err(|e: url::ParseError| e.to_string())?;
-    window.navigate(parsed).map_err(|e| e.to_string())
+    desktop::open_player(app, url)
+}
+
+#[tauri::command]
+async fn connect_server(app: AppHandle, address: String) -> Result<(), String> {
+    let origin = client::normalize_server(&address)?;
+    let probe = origin.clone();
+    tauri::async_runtime::spawn_blocking(move || client::probe_server(&probe))
+        .await
+        .map_err(|e| e.to_string())??;
+    // Only a child owned by this desktop may be stopped.
+    desktop::close_player(&app);
+    app.state::<AppState>().engine.stop(Some(&app))?;
+    client::save(&client::Preferences {
+        mode: client::ConnectionMode::Server,
+        server: Some(origin.clone()),
+    })?;
+    tray::refresh_mode(&app);
+    let target = take_pending_player_url(&app, &format!("{origin}/player/"));
+    desktop::open_player(&app, &target)
+}
+
+#[tauri::command]
+fn change_connection(app: AppHandle) -> Result<(), String> {
+    desktop::close_player(&app);
+    if !client::is_server() {
+        app.state::<AppState>().engine.stop(Some(&app))?;
+    }
+    return_to_shell(&app)?;
+    app.emit("shell-view", "connection")
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn quit_desktop(app: AppHandle) {
+    tray::shutdown(&app);
 }
 
 fn track_capsule_from_deep_link(value: &str) -> Option<String> {
@@ -391,6 +455,14 @@ fn handle_deep_link(app: &AppHandle, value: &str, start_if_idle: bool) {
         *pending = Some(capsule);
     }
 
+    if client::is_server() {
+        if let Some(origin) = client::load().server {
+            let url = take_pending_player_url(app, &format!("{origin}/player/"));
+            let _ = desktop::open_player(app, &url);
+        }
+        tray::focus_main_window(app);
+        return;
+    }
     let status = state.engine.status();
     if status.phase == EnginePhase::Ready {
         if let Some(player_url) = status.player_url {
@@ -408,18 +480,27 @@ fn handle_deep_link(app: &AppHandle, value: &str, start_if_idle: bool) {
     tray::focus_main_window(app);
 }
 
+#[cfg(desktop)]
+fn single_instance() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri_plugin_single_instance::Builder::new()
+        .callback(|app, _argv, _cwd| {
+            tray::focus_main_window(app);
+        })
+        .build()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
     #[cfg(desktop)]
     let builder = builder
         // Must be first so a second protocol launch is forwarded to this process.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            tray::focus_main_window(app);
-        }))
+        .plugin(single_instance())
         .plugin(tauri_plugin_deep_link::init());
 
     builder
+        .on_menu_event(tray::handle_menu)
+        .manage(desktop::DesktopState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
@@ -434,6 +515,11 @@ pub fn run() {
             pending_track_capsule: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
+            connect_server,
+            change_connection,
+            quit_desktop,
+            desktop::desktop_handshake,
+            desktop::desktop_appearance,
             get_startup_profile,
             get_shell_theme,
             start_configured_engine,
@@ -459,8 +545,15 @@ pub fn run() {
             pairing::pairing_qr_data_url,
         ])
         .setup(|app| {
-            tray::build_tray(app.handle())?;
-            tray::register_global_shortcuts(app.handle())?;
+            if let Err(error) = tray::build_tray(app.handle()) {
+                eprintln!("Desktop tray unavailable: {error}");
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                tray::attach_window_menu(app.handle(), &window)?;
+            }
+            if let Err(error) = tray::register_global_shortcuts(app.handle()) {
+                eprintln!("Desktop shortcuts unavailable: {error}");
+            }
 
             #[cfg(desktop)]
             {
@@ -485,6 +578,10 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 window.on_window_event(move |event| match event {
                     WindowEvent::CloseRequested { api, .. } => {
+                        if !tray::available(&app_handle) {
+                            tray::shutdown(&app_handle);
+                            return;
+                        }
                         api.prevent_close();
                         if let Some(window) = app_handle.get_webview_window("main") {
                             let _ = window.hide();
@@ -503,6 +600,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+                desktop::close_player(app);
                 if let Some(state) = app.try_state::<AppState>() {
                     let _ = state.engine.stop(None);
                 }

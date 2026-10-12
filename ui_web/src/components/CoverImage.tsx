@@ -1,6 +1,11 @@
 import { createEffect, createSignal, onCleanup, Show, type JSX } from 'solid-js';
-import { apiOrigin } from '../lib/config';
+import { artworkUrl } from '../lib/config';
 import { artworkCandidates } from '../lib/media';
+
+// URLs only, not image bodies. Previously painted artwork should not re-enter
+// the lazy/async decoding path on every route mount. Bound this session hint.
+const paintedSources = new Set<string>();
+const MAX_PAINTED_SOURCES = 512;
 
 /** Fills its positioned cover slot; observes the actual slot instead of
  * guessing a grid width. The browser chooses the appropriate density. */
@@ -10,7 +15,15 @@ export function CoverImage(props: {
   alt?: string;
   variants?: { url: string; width: number }[];
 }) {
-  const source = () => props.src?.startsWith('/api/') ? `${apiOrigin()}${props.src}` : props.src;
+  const source = () => artworkUrl(props.src);
+  const warm = () => !!source() && paintedSources.has(source()!);
+  const rememberPaint = () => {
+    const url = source();
+    if (!url) return;
+    paintedSources.delete(url);
+    paintedSources.add(url);
+    if (paintedSources.size > MAX_PAINTED_SOURCES) paintedSources.delete(paintedSources.values().next().value!);
+  };
   let image: HTMLImageElement | undefined;
   const [width, setWidth] = createSignal(320);
   const [failed, setFailed] = createSignal(false);
@@ -38,7 +51,7 @@ export function CoverImage(props: {
   };
   return <Show when={props.src && !failed()}>
     <img ref={image} sizes={`${width()}px`} srcset={candidates()} src={fallback()!}
-      alt={props.alt ?? ''} loading={props.eager ? 'eager' : 'lazy'} decoding="async"
-      draggable={false} style={style} onError={() => setFailed(true)} />
+      alt={props.alt ?? ''} loading={props.eager || warm() ? 'eager' : 'lazy'} decoding={warm() ? 'sync' : 'async'}
+      draggable={false} style={style} onLoad={rememberPaint} onError={() => setFailed(true)} />
   </Show>;
 }

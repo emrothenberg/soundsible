@@ -16,7 +16,7 @@ import {
   type NowPlayingLayoutPresetId,
   type NowPlayingPanelId,
 } from '../lib/nowPlayingLayout';
-import { contextContinuation, sameQueueSection, type PlaybackQueueEntry } from '../lib/playbackQueue';
+import { contextContinuation, futureEntries, sameQueueSection, type PlaybackContextKind, type PlaybackQueueEntry } from '../lib/playbackQueue';
 import { contextDestination } from '../lib/playbackContext';
 import { isPodcastTrack } from '../lib/track';
 import { trackCount } from '../lib/format';
@@ -36,6 +36,12 @@ import { hostSession } from '../lib/community';
 import styles from './NowPlaying.module.css';
 
 export type NowPlayingMobilePanel = NowPlayingPanelId;
+
+/** Collections whose card unfolds its upcoming songs in the queue, a page at
+ * a time. The library — the listener's whole collection, a tap away in the
+ * navigation — opens its page instead; a single song or episode has nothing
+ * further to show. */
+const EXPANDING_CONTEXTS: ReadonlySet<PlaybackContextKind> = new Set(['album', 'artist', 'playlist', 'favourites', 'search']);
 
 export function NowPlaying(props: {
   mobilePanel: NowPlayingMobilePanel;
@@ -142,7 +148,7 @@ export function NowPlaying(props: {
         ...(!current ? [{ icon: menuIcons.remove(), label: t('nowPlaying.removeFromQueue'), danger: true,
           onSelect: () => actions.removeQueueEntry(entry.queueId) }] : []),
       ],
-      // Requests move among themselves; the cards below them never move.
+      // Songs move within their lane; collection headers stay in place.
       get canMoveUp() {
         const above = state.playback.queue[queueIndex() - 1];
         return !current && queueIndex() > state.playback.index + 1 && !!above && sameQueueSection(entry, above);
@@ -157,20 +163,24 @@ export function NowPlaying(props: {
       },
       draggable: !current,
       onDragStart: () => { dragFrom = queueIndex(); },
+      onDragEnd: () => { dragFrom = null; },
       onDragOver: (event) => {
-        if (!current) event.preventDefault();
+        const from = dragFrom == null ? undefined : state.playback.queue[dragFrom];
+        if (!current && from && queueIndex() > state.playback.index && sameQueueSection(from, entry)) event.preventDefault();
       },
       onDrop: (event) => {
         event.preventDefault();
         const to = queueIndex();
-        if (dragFrom != null && dragFrom !== to) actions.moveInQueue(dragFrom, to);
+        if (dragFrom != null && dragFrom > state.playback.index && to > state.playback.index && dragFrom !== to) actions.moveInQueue(dragFrom, to);
         dragFrom = null;
       },
     };
   };
 
-  /** The collection the music continues into, as one card. Opening it goes to
-   * its page; removing it stops the continuation and leaves the rest alone.
+  /** The collection the music continues into, as one card. Opening it reveals
+   * its upcoming songs — or, for the library, the listener's whole collection
+   * and a tap away, goes to its page instead. Removing
+   * it stops the continuation and leaves the rest alone.
    * What only changes its wording — shuffle, repeat — is read by the card
    * itself, so flipping it does not rebuild the lanes around it. */
   const contextCard = (): PlayerTrackListCard | null => {
@@ -183,8 +193,16 @@ export function NowPlaying(props: {
     const kind = t(`nowPlaying.contextKind.${context.kind}`);
     const remove = { label: t('nowPlaying.contextRemove', { name: title }), onSelect: () => actions.removeContext() };
     const artworkFromSongs = context.kind === 'album' || context.kind === 'playlist' || context.kind === 'artist';
+    const expands = EXPANDING_CONTEXTS.has(context.kind);
     return {
       id: 'context',
+      songs: expands ? {
+        count: remaining,
+        rows: (limit) => futureEntries(state.playback.queue, state.playback.index, 'context')
+          .slice(0, limit).map((entry, index) => queueRow(entry, index + 1)),
+      } : undefined,
+      onOpen: expands ? undefined : open,
+      openLabel: !expands && open ? t('nowPlaying.contextOpen', { name: title }) : undefined,
       title,
       get detail() {
         return [
@@ -197,8 +215,6 @@ export function NowPlaying(props: {
       seed: context.id,
       cover: context.cover || (artworkFromSongs ? trackCoverUrl(next.next, 'thumb') : undefined),
       glyph: <ContextGlyph kind={context.kind} />,
-      onOpen: open,
-      openLabel: open ? t('nowPlaying.contextOpen', { name: title }) : undefined,
       menu: () => [
         ...(open ? [{ icon: menuIcons.open(), label: t('nowPlaying.contextOpen', { name: title }), onSelect: open }] : []),
         { icon: menuIcons.remove(), label: t('nowPlaying.removeFromQueue'), danger: true, onSelect: remove.onSelect },
@@ -310,7 +326,6 @@ export function NowPlaying(props: {
                 dragHandle={dragHandle}
                 onCloseSurface={props.onCloseSurface}
                 onOpenList={() => props.onMobilePanelChange('queue')}
-                listActive={props.mobilePanel === 'queue'}
                 listLabel={t('nowPlaying.queue')}
               />
             );

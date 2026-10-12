@@ -11,16 +11,12 @@ import { initLocale } from './lib/i18n';
 import { registerServiceWorker } from './lib/pwa';
 import { OverlayOutlet } from './lib/overlay';
 import { installSessionGuard, ready, refreshSession, requiresLogin, user, sessionUnavailable } from './lib/session';
+import { recoveryPlayer } from './boot/playerRecovery';
 // Self-host the design-system typefaces (DESIGN.md) so they render for every
 // user, not only those who happen to have them installed locally. Subsets load
 // on demand via unicode-range. Plus Jakarta Sans 400/500/600/700, JetBrains
 // Mono 400/500 — the weights referenced by --fw-* tokens.
-import '@fontsource/plus-jakarta-sans/400.css';
-import '@fontsource/plus-jakarta-sans/500.css';
-import '@fontsource/plus-jakarta-sans/600.css';
-import '@fontsource/plus-jakarta-sans/700.css';
-import '@fontsource/jetbrains-mono/400.css';
-import '@fontsource/jetbrains-mono/500.css';
+import './boot/fonts';
 import './styles/tokens.css';
 import './styles/app.css';
 
@@ -82,12 +78,6 @@ function StartupReady(props: ParentProps) {
   onMount(() => window.__SOUNDSIBLE_BOOT__?.complete());
   return props.children;
 }
-
-// Compile one alternate entry URL for recovery. WebKit can retain a rejected
-// module fetch even across reloads; importing its original URL repeats the error.
-const recoveryPlayer = import.meta.glob<Component>('./AuthenticatedPlayer.tsx', {
-  query: '?recovery', import: 'default',
-})['./AuthenticatedPlayer.tsx'];
 
 /** Keep playback and sockets out of login, including the accessibility overlay. */
 function AuthenticatedBoundary() {

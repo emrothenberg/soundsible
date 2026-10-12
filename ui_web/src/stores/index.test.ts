@@ -10,6 +10,85 @@ const UNMEASURED_LEVEL = gainToLinear(UNMEASURED_GAIN_DB);
 const t1: Track = { id: 't1', title: 'One', artist: 'Artist', duration: 180 };
 const t2: Track = { id: 't2', title: 'Two', artist: 'Artist', duration: 200 };
 
+describe('portable remote playback', () => {
+  it.each([
+    { id: 'dQw4w9WgXcQ', title: 'Song', artist: 'A', source: 'preview' as const },
+    { id: 'ep', title: 'Episode', artist: 'Show', source: 'preview' as const, media_kind: 'podcast_episode',
+      podcast_episode_guid: 'ep', podcast_enclosure_url: 'https://example.com/episode.mp3' },
+  ])('replaces the receiver DJ session with $title without asking for confirmation', async (track) => {
+    const confirmDialog = vi.fn().mockResolvedValue(false);
+    const store = await loadStore({ __confirmDialog: confirmDialog,
+      podcastPeek: vi.fn().mockResolvedValue({ stream_token: 'receiver-token' }) }); store.initStore(); await flush();
+    store.actions.playFrom([t1, t2], 0);
+    store.actions.enterAutoMode();
+    expect(store.state.autoMode.active).toBe(true);
+    store.fireSocketEvent('playback_start_requested', { track, state: { session: null } });
+    await flush();
+    expect(store.state.autoMode.active).toBe(false);
+    expect(store.state.playback.currentTrack).toMatchObject(track);
+    expect(store.state.playback.queue.map(item => item.id)).toEqual([track.id]);
+    expect(confirmDialog).not.toHaveBeenCalled();
+  });
+
+  it('restores an offline podcast request paused and mints its token on resume', async () => {
+    const track = { id: 'ep', title: 'Episode', artist: 'Show', source: 'preview' as const, media_kind: 'podcast_episode',
+      podcast_episode_guid: 'ep', podcast_enclosure_url: 'https://example.com/episode.mp3' };
+    const podcastPeek = vi.fn().mockResolvedValue({ stream_token: 'reconnected-token' });
+    const store = await loadStore({ podcastPeek, getPlaybackState: vi.fn().mockResolvedValue({
+      device_id: 'dev1', track_id: track.id, track, session: null, position_sec: 0, updated_at: Date.now() / 1000,
+    }) });
+    await store.actions.checkResume();
+    expect(store.state.playback).toMatchObject({ currentTrack: track, phase: 'paused', isPlaying: false });
+    expect(store.audioService.prime).not.toHaveBeenCalled();
+    expect(podcastPeek).not.toHaveBeenCalled();
+    store.actions.resumePlayback(); await flush();
+    expect(podcastPeek).toHaveBeenCalledWith(track.podcast_enclosure_url);
+    expect(store.audioService.load).toHaveBeenCalledWith('/podcast/reconnected-token', 1, expect.any(Number));
+    expect(store.audioService.resume).not.toHaveBeenCalled();
+  });
+
+  it('retains stream identity, record metadata and row identities on the receiver', async () => {
+    const store = await loadStore(); store.initStore(); await flush();
+    const track = { id: 'dQw4w9WgXcQ', source: 'preview', title: 'Song', artist: 'A', album: 'Record',
+      cover: 'https://example.com/cover.jpg', originKeys: ['deezer:42'], artists: ['A', 'B'] };
+    store.fireSocketEvent('playback_start_requested', { track, state: { track_id: track.id, position_sec: 0 } });
+    await flush();
+    expect(store.state.playback.currentTrack).toMatchObject(track);
+    expect(store.audioService.load).toHaveBeenCalledWith('/preview/dQw4w9WgXcQ', expect.any(Number));
+  });
+
+  it('mints a podcast token on the receiver from the portable episode identity', async () => {
+    const podcastPeek = vi.fn().mockResolvedValue({ stream_token: 'receiver-token' });
+    const store = await loadStore({ podcastPeek }); store.initStore(); await flush();
+    const track = { id: 'ep', title: 'Episode', artist: 'Show', source: 'preview', media_kind: 'podcast_episode',
+      podcast_episode_guid: 'ep', podcast_feed_id: 'feed', podcast_enclosure_url: 'https://example.com/episode.mp3' };
+    store.fireSocketEvent('playback_start_requested', { track }); await flush();
+    expect(store.state.playback.currentTrack).toMatchObject(track);
+    expect(podcastPeek).toHaveBeenCalledWith(track.podcast_enclosure_url);
+    expect(store.audioService.load).toHaveBeenCalledWith('/podcast/receiver-token', 1, expect.any(Number));
+  });
+
+  it('resolves a catalogue reference on the receiving device', async () => {
+    const resolveCatalogItem = vi.fn().mockResolvedValue({ video_id: 'dQw4w9WgXcQ' });
+    const store = await loadStore({ resolveCatalogItem }); store.initStore(); await flush();
+    store.fireSocketEvent('playback_start_requested', { track: { id: 'deezer:42', title: 'Song', artist: 'A', source: 'preview',
+      pendingResolve: { catalogItemId: 'deezer:42', title: 'Song', artist: 'A' } } });
+    await vi.waitFor(() => expect(store.state.playback.currentTrack?.id).toBe('dQw4w9WgXcQ'));
+    expect(resolveCatalogItem).toHaveBeenCalled();
+  });
+
+  it('keeps a blocked remote selection ready for a tap without retrying or skipping', async () => {
+    const load = vi.fn().mockRejectedValue(new DOMException('Tap required', 'NotAllowedError'));
+    const store = await loadStore({}, { load }); store.initStore(); await flush();
+    store.fireSocketEvent('playback_start_requested', { track: { ...t1, source: 'preview' } }); await flush();
+    expect(store.state.playback).toMatchObject({ currentTrack: { id: 't1' }, phase: 'paused', needsGesture: true, loadError: false, isLoading: false });
+    expect(load).toHaveBeenCalledTimes(1);
+    store.actions.resumePlayback(); await flush();
+    expect(store.audioService.resume).toHaveBeenCalled();
+    expect(store.state.playback.needsGesture).toBe(false);
+  });
+});
+
 function autoPlan(ids: string[]) {
   return {
     v: 5 as const,
@@ -62,7 +141,7 @@ function stubMediaSession() {
   return { mediaSession, press: (action: string) => handlers.get(action)?.() };
 }
 
-const playbackCleanups: Array<() => void> = [];
+const storeCleanups: Array<() => void> = [];
 
 async function loadStore(
   apiOverrides: Record<string, unknown> = {},
@@ -390,7 +469,7 @@ async function loadStore(
   }));
 
   const store = await import('./index');
-  playbackCleanups.push(() => store.actions.dismissPlayback());
+  storeCleanups.push(() => store.disposeStore());
   const fireSocketEvent = (event: string, data?: unknown) => socketHandlers.get(event)?.(data);
   const fireProgramTransport = (event: Partial<ProgramTransportEvent>) => programTransportReporter?.({
     kind: 'pause',
@@ -438,10 +517,15 @@ beforeEach(() => {
   vi.restoreAllMocks();
 });
 
-// Retire real recovery timers before the next test restores their audio mocks.
-// Longer session-change tests otherwise inherit startup watchdogs from old stores.
-afterEach(() => {
-  for (const cleanup of playbackCleanups.splice(0)) cleanup();
+// Retire the whole authenticated client before the next module generation.
+// Dismissing playback leaves library refreshes, sockets and runtime timers alive;
+// a late callback can otherwise enter the next test's module/mock registry.
+afterEach(async () => {
+  for (const cleanup of storeCleanups.splice(0)) cleanup();
+  // initStore warms discovery with a dynamic import. Disposing its lifetime
+  // cancels callbacks, but cannot cancel module evaluation. Finish that graph
+  // before the next test resets modules and installs another API mock.
+  await vi.dynamicImportSettled();
 });
 
 describe('Solid store library and playback resume', () => {
@@ -574,7 +658,9 @@ describe('Solid store library and playback resume', () => {
 
     await actions.syncLibrary();
     const staleSync = actions.syncLibrary();
-    await Promise.resolve();
+    // The stale request must be the one in flight before the delete, however
+    // many ticks the sync takes to ask for it.
+    await vi.waitFor(() => expect(getLibrary).toHaveBeenCalledTimes(2));
     await actions.deleteTrack('t1');
     expect(state.library.map((t) => t.id)).toEqual(['t2']);
 
@@ -4353,8 +4439,9 @@ describe('preparation ownership after generated queue cleanup', () => {
     actions.playTrack(t1);
     fireDeckEvent('playing');
     actions.enterAutoMode();
-    await flush();
-    expect(preparationOwners[1].ids).toContain('route-00001');
+    // Planning owns asynchronous work beyond one timer turn. Wait for its
+    // observable ownership before testing that leaving Auto releases it.
+    await vi.waitFor(() => expect(preparationOwners[1].ids).toContain('route-00001'));
     actions.exitAutoMode();
     expect(preparationOwners[1].ids).toEqual([]);
   });
@@ -4448,16 +4535,14 @@ describe('podcast progress and time jumps', () => {
     await first;
     expect(audioService.load).not.toHaveBeenCalled();
     actions.resumePlayback();
-    await flush();
-    expect(audioService.load).toHaveBeenLastCalledWith('/podcast/resumed', 1, 0);
+    await vi.waitFor(() => expect(audioService.load).toHaveBeenLastCalledWith('/podcast/resumed', 1, 0));
   });
 
   it('reloads queued streamed episodes through a podcast token', async () => {
     const { actions, audioService, api } = await loadStore({ podcastPeek: vi.fn().mockResolvedValue({ stream_token: 'queued' }) });
     actions.playFrom([{ id: 'episode', title: 'Episode', artist: 'Show', source: 'preview', media_kind: 'podcast_episode', podcast_enclosure_url: episode('a').enclosure_url }], 0);
-    await flush();
+    await vi.waitFor(() => expect(audioService.load).toHaveBeenCalledWith('/podcast/queued', 1, 0));
     expect(api.podcastPeek).toHaveBeenCalledWith(episode('a').enclosure_url);
-    expect(audioService.load).toHaveBeenCalledWith('/podcast/queued', 1, 0);
   });
 });
 
@@ -4477,4 +4562,37 @@ it('authenticated runtime starts once, closes once, and starts a fresh socket fo
   expect(store.createSocket).toHaveBeenCalledTimes(2);
   store.disposeStore();
   expect(store.disconnect).toHaveBeenCalledTimes(2);
+});
+
+
+describe('desktop paused queue navigation', () => {
+  it('selects the next paused track without loading or sounding it, then loads it on play', async () => {
+    const { actions, state, audioService, initStore, fireDeckEvent } = await loadStore();
+    initStore();
+    actions.playFrom([t1, t2], 0);
+    fireDeckEvent('playing');
+    actions.pausePlayback();
+    fireDeckEvent('pause');
+    audioService.load.mockClear();
+    actions.next('next', true);
+    expect(state.playback.currentTrack?.id).toBe('t2');
+    expect(state.playback.isPlaying).toBe(false);
+    expect(state.playback.phase).toBe('paused');
+    expect(audioService.load).not.toHaveBeenCalled();
+    actions.resumePlayback('media_session');
+    expect(audioService.load).toHaveBeenCalled();
+  });
+  it('selects the previous paused track without starting audio', async () => {
+    const { actions, state, audioService, initStore, fireDeckEvent } = await loadStore();
+    initStore();
+    actions.playFrom([t1, t2], 1);
+    fireDeckEvent('playing');
+    actions.pausePlayback();
+    fireDeckEvent('pause');
+    audioService.load.mockClear();
+    actions.prev(true);
+    expect(state.playback.currentTrack?.id).toBe('t1');
+    expect(state.playback.isPlaying).toBe(false);
+    expect(audioService.load).not.toHaveBeenCalled();
+  });
 });

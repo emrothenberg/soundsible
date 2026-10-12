@@ -1194,13 +1194,38 @@ def test_resolve_artist_id_matches_across_diacritics(monkeypatch):
 
 def test_resolve_album_id_matches_across_diacritics(monkeypatch):
     rows = [
-        {"album": {"id": 1, "title": "Something Else"}},
-        {"album": {"id": 2, "title": "Agents of Fortune"}},
-        {"album": {"id": 3, "title": "Sólo pienso en ti"}},
+        {"id": 1, "title": "Something Else", "artist": {"name": "Víctor Manuel"}},
+        {"id": 2, "title": "Agents of Fortune", "artist": {"name": "Blue Öyster Cult"}},
+        {"id": 3, "title": "Sólo pienso en ti", "artist": {"name": "Victor Manuel"}},
+    ]
+    asked = []
+    monkeypatch.setattr(catalog_routes, "_deezer_get", lambda path, params=None, timeout=8: asked.append((path, params)) or {"data": rows})
+
+    assert catalog_routes._resolve_album_deezer_id("Solo pienso en ti", "Víctor Manuel") == "3"
+    # A plain album search: the field syntax finds nothing any more.
+    assert asked == [("search/album", {"q": "Solo pienso en ti Víctor Manuel", "limit": 10})]
+
+
+def test_resolve_album_id_prefers_the_artists_own_album(monkeypatch):
+    rows = [
+        {"id": 7, "title": "Loud", "artist": {"name": "Somebody Else"}},
+        {"id": 8, "title": "Loud", "artist": {"name": "Rihanna"}},
     ]
     monkeypatch.setattr(catalog_routes, "_deezer_get", lambda path, params=None, timeout=8: {"data": rows})
 
-    assert catalog_routes._resolve_album_deezer_id("Solo pienso en ti", "Víctor Manuel") == "3"
+    assert catalog_routes._resolve_album_deezer_id("Loud", "Rihanna") == "8"
+    assert catalog_routes._resolve_album_deezer_id("Loud", "") == "7"
+
+
+def test_resolve_album_id_takes_the_artists_edition_over_a_tribute(monkeypatch):
+    rows = [
+        {"id": 1, "title": "Abbey Road (Remastered 2009)", "artist": {"name": "The Beatles"}},
+        {"id": 2, "title": "Abbey Road (2019 Mix)", "artist": {"name": "The Beatles"}},
+        {"id": 3, "title": "Abbey Road", "artist": {"name": "The Beatles Complete On Ukulele"}},
+    ]
+    monkeypatch.setattr(catalog_routes, "_deezer_get", lambda path, params=None, timeout=8: {"data": rows})
+
+    assert catalog_routes._resolve_album_deezer_id("Abbey Road", "The Beatles") == "1"
 
 
 # ── Owned-track key lookups ────────────────────────────────────────────────
@@ -1446,6 +1471,9 @@ def test_album_profile_lists_every_track_with_its_disc_and_position(monkeypatch)
     assert last["album"] == "Discovery"
     assert last["cover"] == "http://x/discovery.jpg"
     assert last["raw"]["deezer_album_id"] == "302127"
+    # When the record came out and whose it is, which no track row names.
+    assert last["raw"]["year"] == 2001
+    assert last["raw"]["album_artist"] == "Daft Punk"
     assert [params["index"] for path, params in calls if path.endswith("/tracks")] == [0, 20, 40]
 
 
@@ -1456,6 +1484,9 @@ def test_album_profile_keeps_the_embedded_tracks_when_the_listing_fails(monkeypa
 
     assert len(profile["tracklist"]) == 25
     assert "track_number" not in profile["tracklist"][0]["raw"]
+    # The embedded rows name their album without a date; the record supplies it.
+    assert profile["tracklist"][0]["raw"]["year"] == 2001
+    assert profile["tracklist"][0]["album"] == "Discovery"
 
 
 def test_catalog_save_files_the_download_under_the_record_it_came_from(monkeypatch):

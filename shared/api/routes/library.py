@@ -23,28 +23,48 @@ logger = logging.getLogger(__name__)
 library_bp = Blueprint("library", __name__, url_prefix="")
 
 
-def _lyrics_payload(record=None, *, cached=False, status=None, source_kind=None):
+def _lyrics_payload(
+    record=None,
+    *,
+    cached=False,
+    status=None,
+    source_kind=None,
+    audio_duration=None,
+    offset_ms=None,
+):
+    """What a player needs to show lyrics, and whether their timing can be trusted.
+
+    ``timing_safe`` says whether timed lines can be followed as they are: the
+    upload is a class whose timeline matches the album's, and the recording is
+    as long as the one the lines were written for.
+
+    The two failures are answered differently. An upload whose class does not
+    vouch for its timeline (a lyric video, anything unverified) is no evidence
+    of a mismatch, only of not knowing, so its timed lines are withheld and the
+    plain text shows — asking every such stream to be aligned by hand would be
+    noise. A recording of another length *is* evidence, so its lines are sent,
+    flagged, for the listener to line up with a tap. ``offset_ms`` is that
+    correction, if one was made.
+    """
+    from shared.lyrics import has_text, synced_timing_fits
     from shared.music_identity import synced_lyrics_safe
 
     if status is None:
-        status = (
-            "ready"
-            if record and (record.get("synced") or record.get("plain") or record.get("instrumental"))
-            else "not_found"
-        )
-    synced = record.get("synced") if record else None
-    timing_safe = source_kind is None or synced_lyrics_safe(str(source_kind))
-    payload = {
+        status = "ready" if has_text(record) else "not_found"
+    synced_duration = record.get("synced_duration") if record else None
+    vouched = source_kind is None or synced_lyrics_safe(str(source_kind))
+    timing_safe = vouched and synced_timing_fits(audio_duration, synced_duration)
+    return {
         "status": status,
-        "synced": synced if timing_safe else None,
+        "synced": record.get("synced") if record and vouched else None,
         "plain": record.get("plain") if record else None,
         "instrumental": bool(record and record.get("instrumental")),
         "cached": cached,
         "pending": status == "pending",
+        "timing_safe": timing_safe,
+        "synced_duration": synced_duration,
+        "offset_ms": offset_ms,
     }
-    if source_kind is not None:
-        payload["timing_safe"] = timing_safe
-    return payload
 
 
 def _playlist_mutation_response(metadata, status: str = "success"):
@@ -66,6 +86,17 @@ def _commit_playlists(api, lib, metadata):
         raise LibraryPersistenceError(getattr(lib, "last_save_error", "library_conflict"))
     api["emit_to_user"]("library_updated")
     return _playlist_mutation_response(metadata)
+
+
+def _playlist_precondition(metadata, name, data):
+    if "expected_track_ids" not in data:
+        return None
+    expected = data["expected_track_ids"]
+    if not isinstance(expected, list) or not all(isinstance(value, str) for value in expected):
+        return jsonify(error="expected_track_ids must be a string list"), 400
+    if expected != metadata.playlists.get(name):
+        return jsonify(error="Playlist changed; refresh before editing"), 409
+    return None
 
 
 def _get_api():
@@ -369,7 +400,7 @@ def get_track_lyrics(track_id):
     """Lyrics for a library track: served from the local cache when present,
     otherwise fetched from LRCLIB and cached (including not-found results)."""
     from shared.database import instance_db
-    from shared.lyrics import poll_lyrics
+    from shared.lyrics import audio_key, poll_lyrics, predates_timing_length, settle_upgrade, store
 
     api = _get_api()
     lib, _, _ = api["get_core"]()
@@ -378,26 +409,40 @@ def get_track_lyrics(track_id):
         return jsonify({"error": "Track not found"}), 404
 
     db = instance_db()
-    refresh = request.args.get("refresh") in ("1", "true")
-    if not refresh:
-        cached = db.get_lyrics(track_id)
-        if cached:
-            return jsonify(_lyrics_payload(cached, cached=True))
+    offset_ms = db.get_lyrics_offset(audio_key(getattr(track, "youtube_id", None), track.id))
 
-    lookup_status, record = poll_lyrics(track.artist, track.title, track.album, track.duration)
+    def payload(record, cached=False):
+        return jsonify(_lyrics_payload(record, cached=cached, audio_duration=track.duration, offset_ms=offset_ms))
+
+    refresh = request.args.get("refresh") in ("1", "true")
+    cached = None if refresh else db.get_lyrics(track_id)
+    if cached and not predates_timing_length(cached):
+        return payload(cached, cached=True)
+
+    # Lines that predate the timing length are looked up once more. They are
+    # served while that runs, and whenever the provider cannot answer; the
+    # player therefore does not come back for the answer, so the lookup
+    # settles the row itself when it lands.
+    settle = None
+    if cached:
+        def settle(found, held=cached):
+            if found is not None:
+                settle_upgrade(db, track_id, held, found)
+    lookup_status, record = poll_lyrics(track.artist, track.title, track.album, track.duration, on_complete=settle)
     if lookup_status != "complete":
+        if cached:
+            return payload(cached, cached=True)
         return jsonify(_lyrics_payload(status="pending")), 202
     if record is None:
+        if cached:
+            return payload(cached, cached=True)
         # Provider unreachable: don't cache, let a later request retry.
         return jsonify(_lyrics_payload(status="unavailable"))
-    db.set_lyrics(
-        track_id,
-        synced=record["synced"],
-        plain=record["plain"],
-        instrumental=record["instrumental"],
-        source=record["source"],
-    )
-    return jsonify(_lyrics_payload(record))
+    if cached:
+        served = settle_upgrade(db, track_id, cached, record)
+        return payload(served, cached=served is not record)
+    store(db, track_id, record)
+    return payload(record)
 
 
 @library_bp.route("/api/lyrics", methods=["GET"])
@@ -407,12 +452,13 @@ def get_lyrics_by_metadata():
     Saved previews may opt into a persistent cache keyed by their normalized
     metadata; cold provider work runs through the bounded coordinator."""
     from shared.database import instance_db
-    from shared.lyrics import metadata_cache_key, poll_lyrics
+    from shared.lyrics import audio_key, metadata_cache_key, poll_lyrics, store
 
     artist = (request.args.get("artist") or "").strip()
     title = (request.args.get("title") or "").strip()
     album = (request.args.get("album") or "").strip() or None
     source_kind = (request.args.get("source_kind") or "").strip() or None
+    youtube_id = (request.args.get("youtube_id") or "").strip() or None
     try:
         duration = int(request.args.get("duration") or 0) or None
     except ValueError:
@@ -423,11 +469,18 @@ def get_lyrics_by_metadata():
     persist = request.args.get("persist") in ("1", "true")
     refresh = request.args.get("refresh") in ("1", "true")
     db = instance_db()
+    offset_ms = db.get_lyrics_offset(audio_key(youtube_id))
+
+    def payload(record, cached=False):
+        return jsonify(_lyrics_payload(
+            record, cached=cached, source_kind=source_kind, audio_duration=duration, offset_ms=offset_ms,
+        ))
+
     cache_key = metadata_cache_key(artist, title, album, duration)
     if persist and not refresh:
         cached = db.get_lyrics(cache_key)
         if cached:
-            return jsonify(_lyrics_payload(cached, cached=True, source_kind=source_kind))
+            return payload(cached, cached=True)
 
     lookup_status, record = poll_lyrics(artist, title, album, duration)
     if lookup_status != "complete":
@@ -435,14 +488,119 @@ def get_lyrics_by_metadata():
     if record is None:
         return jsonify(_lyrics_payload(status="unavailable"))
     if persist:
-        db.set_lyrics(
-            cache_key,
-            synced=record["synced"],
-            plain=record["plain"],
-            instrumental=record["instrumental"],
-            source=record["source"],
-        )
-    return jsonify(_lyrics_payload(record, source_kind=source_kind))
+        store(db, cache_key, record)
+    return payload(record)
+
+
+#: Further than any intro or coda a cut adds; anything beyond is a typo.
+_MAX_LYRICS_OFFSET_MS = 10 * 60 * 1000
+
+
+@library_bp.route("/api/lyrics/offset", methods=["PUT"])
+@require_scope(SCOPE_LIBRARY_WRITE, allow_trusted_network=True)
+@rate_limit("lyrics_offset", limit=60, window_sec=60)
+def set_lyrics_offset():
+    """Line a recording's lyrics up by hand: ``offset_ms`` later (or earlier,
+    negative) than their timing says. ``null`` forgets the correction.
+
+    Names the audio by ``track_id`` (a library track) or ``youtube_id`` (a
+    stream). The offset belongs to that audio for everyone on this engine:
+    it is a fact about the recording, not a preference.
+    """
+    from shared.database import instance_db
+    from shared.lyrics import audio_key
+
+    data = request.get_json(silent=True) or {}
+    raw = data.get("offset_ms")
+    if raw is None:
+        offset_ms = None
+    elif isinstance(raw, bool) or not isinstance(raw, (int, float)) or abs(raw) > _MAX_LYRICS_OFFSET_MS:
+        return jsonify({"error": "offset_ms must be milliseconds within ten minutes, or null"}), 400
+    else:
+        offset_ms = int(round(raw))
+
+    track_id = str(data.get("track_id") or "").strip()
+    if track_id:
+        api = _get_api()
+        lib, _, _ = api["get_core"]()
+        track = api["get_track_by_id"](lib, track_id)
+        if not track:
+            return jsonify({"error": "Track not found"}), 404
+        key = audio_key(getattr(track, "youtube_id", None), track.id)
+    else:
+        key = audio_key(str(data.get("youtube_id") or "").strip() or None)
+    if not key:
+        return jsonify({"error": "track_id or a valid youtube_id is required"}), 400
+
+    instance_db().set_lyrics_offset(key, offset_ms)
+    return jsonify({"offset_ms": offset_ms})
+
+
+@library_bp.route("/api/library/track-labels/<track_id>/metadata", methods=["POST"])
+@require_scope(SCOPE_LIBRARY_WRITE, allow_trusted_network=True)
+@rate_limit("library_edit_labels", limit=60, window_sec=60)
+@serialized
+def update_track_labels(track_id):
+    """Edit library labels while keeping audio, storage identity and references."""
+    api = _get_api()
+    lib, _, _ = api["get_core"]()
+    if not api["get_track_by_id"](lib, track_id):
+        return jsonify({"error": "Track not found"}), 404
+    data = request.get_json(silent=True)
+    allowed = {"title", "artist", "album", "album_artist"}
+    if not isinstance(data, dict) or not data or not set(data) <= allowed:
+        return jsonify({"error": "Invalid metadata fields"}), 400
+    if any(not (isinstance(value, str) and len(value) <= 4096)
+           and not (key == "album_artist" and value is None)
+           for key, value in data.items()):
+        return jsonify({"error": "Invalid metadata value"}), 400
+    if not api["_mark_track_metadata_updated"](lib, track_id, changes=data):
+        return jsonify({"error": "Track not found"}), 404
+    return jsonify({"status": "success", "storage": "library", "id": track_id})
+
+
+@library_bp.route("/api/library/track-labels/<track_id>/cover", methods=["POST"])
+@require_scope(SCOPE_LIBRARY_WRITE, allow_trusted_network=True)
+@rate_limit("library_edit_label_cover", limit=30, window_sec=60)
+@serialized
+def upload_track_label_cover(track_id):
+    """Persist a validated sidecar; never download/rewrite/re-key the audio."""
+    from shared.artwork import artwork_store, open_image, MAX_BYTES
+    from PIL import Image, UnidentifiedImageError
+    api = _get_api()
+    lib, _, _ = api["get_core"]()
+    if not api["get_track_by_id"](lib, track_id):
+        return jsonify({"error": "Track not found"}), 404
+    file = request.files.get("file")
+    if file is None or not file.filename:
+        return jsonify({"error": "Image file required"}), 400
+    store = artwork_store()
+    data = file.stream.read(MAX_BYTES + 1)
+    try:
+        open_image(data)
+    except (ValueError, UnidentifiedImageError, OSError, Image.DecompressionBombError):
+        return jsonify({"error": "Invalid artwork"}), 400
+    digest = store.put(data)
+    # Commit account metadata first; a failed save never publishes the new cover.
+    if not api["_mark_track_metadata_updated"](lib, track_id, cover_source="manual"):
+        return jsonify({"error": "Track not found"}), 404
+    store.bind(track_id, digest, "manual")
+    api["emit_to_user"]("library_updated", payload={"cover_changed": True})
+    return jsonify({"status": "success", "storage": "library", "id": track_id})
+
+
+@library_bp.route("/api/library/track-labels/<track_id>/cover/none", methods=["POST"])
+@require_scope(SCOPE_LIBRARY_WRITE, allow_trusted_network=True)
+@rate_limit("library_clear_label_cover", limit=30, window_sec=60)
+@serialized
+def clear_track_label_cover(track_id):
+    api = _get_api()
+    lib, _, _ = api["get_core"]()
+    if not api["get_track_by_id"](lib, track_id):
+        return jsonify({"error": "Track not found"}), 404
+    if not api["_mark_track_metadata_updated"](lib, track_id, cover_source="none"):
+        return jsonify({"error": "Track not found"}), 404
+    return jsonify({"status": "success", "storage": "library", "id": track_id})
 
 
 @library_bp.route("/api/library/tracks/<track_id>/metadata", methods=["POST"])
@@ -488,7 +646,7 @@ def update_track_metadata(track_id):
             "title": str(new_meta.get("title", track.title) or ""),
             "artist": str(new_meta.get("artist", track.artist) or ""),
             "album": str(new_meta.get("album", track.album) or ""),
-            "album_artist": str(new_meta["album_artist"] or "") if new_meta.get("album_artist") is not None else track.album_artist,
+            "album_artist": str(new_meta["album_artist"] or "") if new_meta.get("album_artist") is not None else None,
             "metadata_modified_by_user": True,
         }
         api["_mark_track_metadata_updated"](lib, track_id, changes=changes)
@@ -676,13 +834,37 @@ def set_saved():
     if len(entries) > _MAX_SAVED_BATCH:
         return jsonify({"error": f"at most {_MAX_SAVED_BATCH} entries at once"}), 400
 
-    changed = api["favourites_manager"].set_saved(entries, saved)
+    enriched: list = []
+    changed = api["favourites_manager"].set_saved(entries, saved, enriched)
     if saved:
         for entry in changed:
             _schedule_favourite_resolve(entry)
-    if changed:
+    if changed or enriched:
         api["emit_to_user"]("favourites_updated")
     return jsonify({"status": "success", "changed": len(changed)})
+
+
+@library_bp.route("/api/library/favourites", methods=["PUT"])
+@require_scope(SCOPE_LIBRARY_WRITE, allow_trusted_network=True)
+@rate_limit("library_set_favourite", limit=120, window_sec=60)
+def set_favourite():
+    """Set a captured intention without toggling another client's updated mark."""
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify(error="object body required"), 400
+    entry, marked = data.get("entry"), data.get("marked")
+    if not isinstance(entry, dict) or not isinstance(marked, bool):
+        return jsonify(error="entry and boolean marked are required"), 400
+    api = _get_api()
+    api["get_core"]()
+    try:
+        result = api["favourites_manager"].set_favourite(entry, favourite=marked, save_if_missing=False)
+    except ValueError:
+        return jsonify(error="entry needs at least one identity key"), 400
+    if result and not any(isinstance(key, str) and key.startswith("lib:") for key in entry.get("keys", [])):
+        _schedule_favourite_resolve(entry)
+    api["emit_to_user"]("favourites_updated")
+    return jsonify(is_favourite=result)
 
 
 @library_bp.route("/api/library/favourites/toggle", methods=["POST"])
@@ -786,6 +968,7 @@ def create_playlist():
     return _commit_playlists(api, lib, metadata)
 
 
+@library_bp.route("/api/library/playlist-edits", methods=["PATCH"])
 @library_bp.route("/api/library/playlists", methods=["PATCH"])
 @require_scope(SCOPE_LIBRARY_WRITE, allow_trusted_network=True)
 @rate_limit("playlist_reorder", limit=60, window_sec=60)
@@ -796,9 +979,20 @@ def reorder_playlists():
     if not metadata:
         return jsonify({"error": "Library not loaded"}), 404
     data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify(error="object body required"), 400
+    if request.path.startswith("/api/library/playlist-edits") and "expected_order" not in data:
+        return jsonify(error="expected_order required"), 400
     order = data.get("order")
     if not isinstance(order, list):
         return jsonify({"error": "order must be a list of playlist names"}), 400
+    if "expected_order" in data:
+        if not isinstance(data["expected_order"], list) or not all(isinstance(name, str) for name in data["expected_order"]):
+            return jsonify(error="expected_order must be a string list"), 400
+        if data["expected_order"] != metadata.ordered_playlist_names():
+            return jsonify(error="Playlist order changed; refresh before editing"), 409
+        if not all(isinstance(name, str) for name in order) or len(order) != len(set(order)) or set(order) != set(metadata.playlists):
+            return jsonify(error="order must contain every playlist once"), 400
     metadata.reorder_playlists(order)
     return _commit_playlists(api, lib, metadata)
 
@@ -841,6 +1035,7 @@ def remove_track_from_playlist(name, track_id):
     return _commit_playlists(api, lib, metadata)
 
 
+@library_bp.route("/api/library/playlist-edits/<path:name>", methods=["PATCH"])
 @library_bp.route("/api/library/playlists/<path:name>", methods=["PATCH"])
 @require_scope(SCOPE_LIBRARY_WRITE, allow_trusted_network=True)
 @rate_limit("playlist_update", limit=80, window_sec=60)
@@ -854,6 +1049,23 @@ def update_playlist(name):
     if name not in metadata.playlists:
         return jsonify({"error": "Playlist not found"}), 404
     data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify(error="object body required"), 400
+    if request.path.startswith("/api/library/playlist-edits") and "expected_track_ids" not in data:
+        return jsonify(error="expected_track_ids required"), 400
+    conflict = _playlist_precondition(metadata, name, data)
+    if conflict is not None:
+        return conflict
+    # Validate the entire edit before mutating the shared in-memory metadata.
+    proposed_ids = data.get("track_ids", metadata.playlists[name])
+    if not isinstance(proposed_ids, list) or not all(isinstance(value, str) for value in proposed_ids):
+        return jsonify(error="track_ids must be a string list"), 400
+    if "name" in data and (not isinstance(data["name"], str) or not data["name"].strip()):
+        return jsonify(error="name cannot be empty"), 400
+    if "cover_track_id" in data:
+        cover = data["cover_track_id"]
+        if cover is not None and (not isinstance(cover, str) or (cover.strip() and cover.strip() not in proposed_ids)):
+            return jsonify(error="Invalid cover_track_id (not in playlist)"), 400
     if "name" in data:
         new_name = (data.get("name") or "").strip()
         if not new_name:
@@ -876,6 +1088,7 @@ def update_playlist(name):
     return _commit_playlists(api, lib, metadata)
 
 
+@library_bp.route("/api/library/playlist-edits/<path:name>", methods=["DELETE"])
 @library_bp.route("/api/library/playlists/<path:name>", methods=["DELETE"])
 @require_scope(SCOPE_LIBRARY_WRITE, allow_trusted_network=True)
 @rate_limit("playlist_delete", limit=60, window_sec=60)
@@ -886,6 +1099,14 @@ def delete_playlist(name):
     lib, metadata = api["_ensure_lib_metadata"]()
     if not metadata:
         return jsonify({"error": "Library not loaded"}), 404
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify(error="object body required"), 400
+    if request.path.startswith("/api/library/playlist-edits") and "expected_track_ids" not in data:
+        return jsonify(error="expected_track_ids required"), 400
+    conflict = _playlist_precondition(metadata, name, data)
+    if conflict is not None:
+        return conflict
     if not metadata.delete_playlist(name):
         return jsonify({"error": "Playlist not found"}), 404
     return _commit_playlists(api, lib, metadata)

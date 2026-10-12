@@ -336,6 +336,21 @@ export function createTransport(ports: TransportPorts, lifetime: RuntimeLifetime
     const track = state.playback.queue[i];
     if (!track) return;
     const pb = state.playback;
+    if (opts.paused) {
+      ports.releasePreparation();
+      beginLoad();
+      cancelActiveAttempt('paused_selection');
+      runWhenAudible = null;
+      audioService.stop();
+      unmatchedSelection = { queueId: track.queueId, paused: true };
+      setState('playback', {
+        currentTrack: track, index: i, isPlaying: false, isLoading: false,
+        loadError: false, needsGesture: false, phase: 'paused',
+        previewPreparation: null, currentTime: 0, duration: track.duration ?? 0,
+      });
+      ports.updateMediaSession(track);
+      return;
+    }
     const deckHoldsIt = unmatchedSelection?.queueId !== track.queueId;
     if (!opts.restart && !pb.loadError && deckHoldsIt && i === pb.index && pb.currentTrack?.id === track.id) {
       if (pb.isLoading || pb.isPlaying) return; // already on its way / already sounding
@@ -397,7 +412,7 @@ export function createTransport(ports: TransportPorts, lifetime: RuntimeLifetime
       ports.podcastSourcePending = false;
       return audioService.load(podcastStreamUrl(stream_token), 1, resumePosition);
     })) : staged ?? (opts.freshDeck ? audioService.recover(trackUrl(track), resumePosition, level) : isPodcastTrack(track) ? audioService.load(trackUrl(track), level, resumePosition) : audioService.load(trackUrl(track), level));
-    void Promise.resolve(start).catch(lifetime.guard(() => onPlaybackFailed(generation, 'load')));
+    void Promise.resolve(start).catch(lifetime.guard((error: unknown) => onStartRejected(generation, error)));
     // `waiting` is not guaranteed for a media element whose play promise never
     // settles. Arm startup supervision from the request itself so an infinite
     // 0:00 spinner has a bounded recovery path.
@@ -426,6 +441,17 @@ export function createTransport(ports: TransportPorts, lifetime: RuntimeLifetime
     });
   }
   let runWhenAudible: (() => void) | null = null;
+  function onStartRejected(generation: number, error: unknown): void {
+    if (generation !== loadGeneration) return;
+    if (error && typeof error === 'object' && 'name' in error && error.name === 'NotAllowedError') {
+      clearStallTimer();
+      cancelActiveAttempt('gesture_required');
+      setState('playback', { isPlaying: false, isLoading: false, loadError: false, needsGesture: true, phase: 'paused' });
+      ports.pushPlaybackState();
+      return;
+    }
+    onPlaybackFailed(generation, 'load');
+  }
   function flushWhenAudible(): void {
     const work = runWhenAudible;
     runWhenAudible = null;
@@ -823,7 +849,7 @@ export function createTransport(ports: TransportPorts, lifetime: RuntimeLifetime
         isLoading: true,
         phase: 'loading'
       });
-      void audioService.resume(origin).catch(lifetime.guard(() => onPlaybackFailed(attempt.generation, 'load')));
+      void audioService.resume(origin).catch(lifetime.guard((error: unknown) => onStartRejected(attempt.generation, error)));
     },
     pausePlayback(origin: ProgramTransportOrigin = 'ui'): void {
       const pb = state.playback;
@@ -901,14 +927,14 @@ export function createTransport(ports: TransportPorts, lifetime: RuntimeLifetime
         freshDeck: true
       });
     },
-    next(trigger: PlaybackTrigger = 'next'): void {
+    next(trigger: PlaybackTrigger = 'next', preservePaused = false): void {
       // Every path out of here either loads a deck or does nothing; loading
       // cancels the mixer, which reports back and clears the DJ state itself.
       if (audioService.mixPhase() !== 'idle') audioService.cancelMix('load');
       const pb = state.playback;
       if (pb.queue.length === 0) return;
       if (pb.index < pb.queue.length - 1) loadIndex(pb.index + 1, {
-        trigger
+        trigger, paused: preservePaused && !pb.isPlaying
       });else if (pb.repeat === 'all') {
         const cycle = ports.repeatCycle(pb.queue);
         if (cycle.length > 0) {
@@ -917,18 +943,18 @@ export function createTransport(ports: TransportPorts, lifetime: RuntimeLifetime
             index: 0
           });
           loadIndex(0, {
-            trigger
+            trigger, paused: preservePaused && !pb.isPlaying
           });
         }
       }
     },
-    prev(): void {
+    prev(preservePaused = false): void {
       if (state.playback.currentTime > 3) {
         ports.actions.seek(0);
         return;
       }
       const pb = state.playback;
-      if (pb.index > 0) loadIndex(pb.index - 1);else ports.actions.seek(0);
+      if (pb.index > 0) loadIndex(pb.index - 1, { paused: preservePaused && !pb.isPlaying });else ports.actions.seek(0);
     },
     seekBy(delta: number): void {
       ports.actions.seek(audioService.snapshot().position + delta);

@@ -4,20 +4,15 @@ use std::path::{Path, PathBuf};
 
 pub const STATE_FILENAME: &str = "desktop-engine-state.json";
 
+// The engine writes more than this (pid, version, other directories); serde
+// skips what the shell never reads.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct EngineRuntimeState {
-    pub mode: String,
-    pub pid: u32,
-    pub host: String,
-    pub port: u16,
     pub base_url: String,
     pub health: String,
-    pub version: String,
     pub owner_token_file: Option<String>,
-    pub config_dir: String,
     pub log_dir: String,
-    pub music_dir: String,
 }
 
 impl EngineRuntimeState {
@@ -109,7 +104,7 @@ pub struct Appearance {
     pub color: Option<String>,
 }
 
-pub const APPEARANCE_FILENAME: &str = "theme.json";
+pub const APPEARANCE_FILENAME: &str = "desktop-appearance.json";
 
 /// Resolve the stored preference against the OS, the way the player's pre-paint
 /// script does. `system` — and an absent, unreadable or unknown file — follow
@@ -119,7 +114,10 @@ pub fn resolve_appearance(raw: Option<&str>, os_prefers_dark: bool) -> Appearanc
     let prefs = raw.and_then(|raw| serde_json::from_str::<AppearancePrefs>(raw).ok());
 
     let Some(prefs) = prefs else {
-        return Appearance { theme: fallback.to_string(), color: None };
+        return Appearance {
+            theme: fallback.to_string(),
+            color: None,
+        };
     };
     let theme = match prefs.theme.as_deref() {
         None | Some("system") => fallback,
@@ -140,6 +138,8 @@ pub fn load_appearance(os_prefers_dark: bool) -> Appearance {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StartupProfile {
+    pub mode: String,
+    pub server: Option<String>,
     pub returning_user: bool,
     pub music_dir: Option<String>,
     pub auto_start: bool,
@@ -151,6 +151,8 @@ pub fn startup_profile(skip_autostart: bool) -> StartupProfile {
     let returning_user = has_consumer_config() && music_dir.is_some();
     let has_saved_path = config_dir().join("music_dir.json").is_file();
     StartupProfile {
+        mode: "choose".into(),
+        server: None,
         returning_user,
         music_dir,
         auto_start: returning_user && !skip_autostart,
@@ -265,8 +267,14 @@ mod tests {
 
     #[test]
     fn system_follows_the_desktop() {
-        assert_eq!(resolve_appearance(Some(&stored("system")), true).theme, "dark");
-        assert_eq!(resolve_appearance(Some(&stored("system")), false).theme, "light");
+        assert_eq!(
+            resolve_appearance(Some(&stored("system")), true).theme,
+            "dark"
+        );
+        assert_eq!(
+            resolve_appearance(Some(&stored("system")), false).theme,
+            "light"
+        );
     }
 
     #[test]

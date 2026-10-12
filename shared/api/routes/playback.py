@@ -2,7 +2,9 @@
 Streaming, cover, preview, and playback queue/state routes.
 """
 
+import json
 import logging
+import math
 import os
 import re
 import time
@@ -245,8 +247,10 @@ def _emit_playback_stop(api, scope: str, device_id: str) -> None:
     api["socketio"].emit("playback_stop_requested", {}, room=_playback_room(scope, device_id))
 
 
-def _emit_playback_start(api, scope: str, device_id: str, state: dict, track: dict | None = None) -> None:
+def _emit_playback_start(api, scope: str, device_id: str, state: dict, track: dict | None = None, *, handoff: bool = False) -> None:
     payload = {"state": state}
+    if handoff:
+        payload["handoff"] = True
     if track:
         payload["track"] = track
     api["socketio"].emit("playback_start_requested", payload, room=_playback_room(scope, device_id))
@@ -279,7 +283,10 @@ def register_playback_device():
 def list_playback_devices():
     api = _get_api()
     scope = api["get_scope_from_request"]()
-    return jsonify({"devices": api["list_registered_devices"](scope)})
+    return jsonify({"devices": [
+        {**device, "socket_active": bool(device.get("active_sid"))}
+        for device in api["list_registered_devices"](scope)
+    ]})
 
 
 @playback_bp.route("/api/static/stream/<track_id>", methods=["GET"])
@@ -514,13 +521,21 @@ def _serve_cached_preview(
         cached_bytes = os.path.getsize(path)
     except OSError:
         pass
-    response = send_file(str(path), mimetype=content_type, conditional=True)
+    metadata = preview_cache.cached_metadata(video_id)
+    # mtime is LRU recency, not a content validator: mark_served touches it on
+    # every read. Pin If-Range to the committed layout, including atomic remuxes.
+    # Legacy entries have no validator until reacquired, but still serve ranges.
+    response = send_file(
+        str(path), mimetype=content_type, conditional=False,
+        etag=metadata.get("revision") or False,
+    )
+    response.headers.pop("Last-Modified", None)
+    response.make_conditional(request.environ, accept_ranges=True, complete_length=cached_bytes)
     preview_cache.mark_served(video_id)
     response.headers["Cache-Control"] = "private, max-age=86400"
     response.headers["X-Soundsible-Playback-Source"] = "preview"
     response.headers["X-Soundsible-Playback-Cache"] = cache_state
     response.headers["X-Soundsible-Playback-Egress"] = egress
-    metadata = preview_cache.cached_metadata(video_id)
     return _report_stream_response(
         response,
         track_id=video_id,
@@ -1291,7 +1306,7 @@ def playback_handoff():
     if not track_payload and isinstance(target_state.get("track"), dict):
         track_payload = target_state["track"]
 
-    _emit_playback_start(api, scope, to_device_id, target_state, track=track_payload)
+    _emit_playback_start(api, scope, to_device_id, target_state, track=track_payload, handoff=True)
     response = {
         "status": "sent",
         "from_device_id": from_device_id,
@@ -1316,6 +1331,72 @@ def playback_notify_stop():
     return jsonify({"status": "sent"})
 
 
+def _remote_track(value):
+    """Bound a portable element. Only normal player source resolvers may fetch audio."""
+    if not isinstance(value, dict) or len(json.dumps(value).encode("utf-8")) > 32768:
+        raise ValueError("track must be an object of at most 32 KiB")
+    track_id = value.get("id")
+    if not isinstance(track_id, str) or not track_id.strip() or len(track_id) > 512:
+        raise ValueError("track.id required (at most 512 characters)")
+    if value.get("source") not in (None, "local", "preview"):
+        raise ValueError("Unsupported track source")
+    # File paths, tokens, URLs resolved on the sender and queue/session ownership
+    # never travel. Local metadata is read from the library instead.
+    track = {"id": track_id}
+    for key in (
+        "title", "artist", "album", "album_artist", "cover", "youtube_id",
+        "media_kind", "podcast_episode_guid", "podcast_enclosure_url", "podcast_feed_id",
+        "podcast_rss_url", "deezer_artist_id", "deezer_album_id", "canonical_identity",
+        "source_title", "source_artist", "discovery_youtube_id", "playback_source_kind",
+    ):
+        field = value.get(key)
+        if field is not None:
+            if not isinstance(field, str) or len(field) > 4096:
+                raise ValueError(f"Invalid track.{key}")
+            track[key] = field
+    for key in ("duration", "track_number", "disc_number", "year"):
+        field = value.get(key)
+        if field is not None:
+            if isinstance(field, bool) or not isinstance(field, (int, float)) or not math.isfinite(field) or field < 0:
+                raise ValueError(f"Invalid track.{key}")
+            track[key] = field
+    for key in ("originKeys", "artists"):
+        field = value.get(key)
+        if field is not None:
+            if not isinstance(field, list) or len(field) > 64 or any(not isinstance(item, str) or len(item) > 512 for item in field):
+                raise ValueError(f"Invalid track.{key}")
+            track[key] = field
+    if isinstance(value.get("artist_is_channel"), bool):
+        track["artist_is_channel"] = value["artist_is_channel"]
+    if value.get("source") != "preview":
+        return track
+    track["source"] = "preview"
+    if track.get("media_kind") == "podcast_episode" or track.get("podcast_episode_guid"):
+        from shared.podcast_rss import assert_safe_http_url
+        if not track.get("podcast_enclosure_url"):
+            raise ValueError("Podcast enclosure URL required")
+        assert_safe_http_url(track["podcast_enclosure_url"])
+        track["media_kind"] = "podcast_episode"
+    elif value.get("pendingResolve") is not None:
+        pending = value["pendingResolve"]
+        if not isinstance(pending, dict) or any(
+            not isinstance(pending.get(key), str) or not pending[key].strip() or len(pending[key]) > limit
+            for key, limit in (("catalogItemId", 512), ("artist", 4096), ("title", 4096))
+        ):
+            raise ValueError("Invalid pending catalogue reference")
+        track["pendingResolve"] = {key: pending[key] for key in ("catalogItemId", "artist", "title")}
+        if "duration" in track:
+            track["pendingResolve"]["duration"] = track["duration"]
+    else:
+        video_id = track.get("youtube_id") or track_id
+        if not validate_youtube_video_id(video_id):
+            raise ValueError("Invalid YouTube video id")
+        # Both web and native preview resolvers use the playable id as the id.
+        track["id"] = video_id
+        track["youtube_id"] = video_id
+    return track
+
+
 @playback_bp.route("/api/playback/remote-command", methods=["POST"])
 @require_scope(SCOPE_PLAYBACK_CONTROL, allow_trusted_network=True)
 def playback_remote_command():
@@ -1337,14 +1418,37 @@ def playback_remote_command():
     if command == "pause":
         _emit_playback_stop(api, scope, device_id)
         api["put_playback_state"](scope, {
+            **(api["get_playback_state"](scope, device_id=device_id) or {}),
             "is_playing": False,
             "device_id": device_id,
             "device_name": target.get("device_name"),
         })
     elif command == "play":
-        track_id = (data.get("track_id") or "").strip()
+        raw_id = data.get("track_id") or ""
+        if not isinstance(raw_id, str):
+            return jsonify({"error": "track_id must be a string"}), 400
+        track_id = raw_id.strip()
+        descriptor = None
+        if "track" in data:
+            try:
+                descriptor = _remote_track(data["track"])
+                if track_id and track_id != data["track"]["id"]:
+                    raise ValueError("track_id must match track.id")
+                position = float(data.get("position_sec") or 0)
+                if not math.isfinite(position) or not 0 <= position <= 604800:
+                    raise ValueError("Invalid position_sec")
+            except (TypeError, ValueError, OverflowError) as error:
+                return jsonify({"error": str(error)}), 400
+            track_id = descriptor["id"]
         state = api["get_playback_state"](scope, device_id=device_id) or api["get_playback_state"](scope)
-        if track_id:
+        if descriptor and descriptor.get("source") == "preview":
+            target_state = {
+                "track_id": track_id, "track": descriptor,
+                "position_sec": position, "is_playing": True,
+                "device_id": device_id, "device_name": target.get("device_name"),
+                "session": None,
+            }
+        elif track_id:
             lib, engine, queue = api["get_core"]()
             track = api["get_track_by_id"](lib, track_id)
             if track:
@@ -1356,6 +1460,7 @@ def playback_remote_command():
                     "is_playing": True,
                     "device_id": device_id,
                     "device_name": target.get("device_name"),
+                    "session": None,
                 }
             elif state and state.get("track_id") == track_id:
                 target_state = {

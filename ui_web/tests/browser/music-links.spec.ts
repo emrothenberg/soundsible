@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type BrowserContext } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 import { mockMusicEngine, openMusicPlayer } from './music-browser-fixture';
 import { settledBox } from './settle';
@@ -7,12 +7,16 @@ async function activate(page: Page, link: ReturnType<Page['getByRole']>, mobile:
   if (mobile) await link.tap(); else await link.click();
 }
 
-test.beforeEach(async ({ page }) => {
-  await mockMusicEngine(page);
+async function mockArtist(page: Page | BrowserContext) {
   await page.route('**/api/catalog/artist**', (route) => route.fulfill({ json: {
     artist: 'Artista 7', resolved: true, in_library: true,
     top_tracks: [], albums: [], singles_eps: [], related_artists: [], candidates: [],
   } }));
+}
+
+test.beforeEach(async ({ page }) => {
+  await mockMusicEngine(page);
+  await mockArtist(page);
 });
 
 test('artist links navigate without playing and preserve browser history', async ({ page, isMobile }) => {
@@ -112,13 +116,35 @@ test('album cards open from their artwork, in the library and in search', async 
 
 test('desktop artist links support keyboard and a separate tab', async ({ page, isMobile, context }) => {
   test.skip(isMobile, 'Desktop keyboard and modifier behavior');
+  // The new tab needs the same authenticated engine before its scripts run.
+  await mockMusicEngine(context);
+  await mockArtist(context);
   await page.goto('/player/#/library?view=songs');
+  await expect(page.locator('html')).not.toHaveAttribute('data-booting', '');
   const link = page.getByRole('link', { name: 'Artista 7', exact: true }).first();
   await expect(link).toBeVisible();
-  const opened = context.waitForEvent('page');
+  await settledBox(page, link);
+  // A modified click is the browser's: the app must leave it alone so the
+  // browser can open a tab. Whether Chromium then spawns one is its own
+  // business — and racy under Playwright's request interception, where a tab
+  // it opens by itself can sit with its module graph never requested — so the
+  // tab is opened here, at the address the link names.
+  await page.evaluate(() => {
+    const seen = window as unknown as { modifiedClick?: 'seen' | 'prevented' };
+    const preventDefault = Event.prototype.preventDefault;
+    document.addEventListener('click', (event) => { if (event.ctrlKey) seen.modifiedClick ??= 'seen'; }, true);
+    Event.prototype.preventDefault = function (this: Event) {
+      if (this.type === 'click' && (this as MouseEvent).ctrlKey) seen.modifiedClick = 'prevented';
+      preventDefault.call(this);
+    };
+  });
   await link.click({ modifiers: ['Control'] });
-  const tab = await opened;
+  expect(await page.evaluate(() => (window as unknown as { modifiedClick?: string }).modifiedClick)).toBe('seen');
+  await expect(page).toHaveURL(/#\/library\?view=songs$/);
+  const tab = await context.newPage();
+  await tab.goto(new URL((await link.getAttribute('href'))!, page.url()).href);
   await expect(tab).toHaveURL(/#\/artist\/Artista%207\?view=library/);
+  await expect(tab.getByRole('heading', { name: 'Artista 7', exact: true })).toBeVisible();
   await tab.close();
   await expect(page).toHaveURL(/#\/library\?view=songs$/);
   await link.focus();

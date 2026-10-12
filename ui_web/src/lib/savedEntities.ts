@@ -1,38 +1,21 @@
 import { createSignal } from 'solid-js';
+import { createStore, reconcile } from 'solid-js/store';
 import { api } from './api';
 import { t } from './i18n';
 import { toast } from './toast';
 import { pulseNavigation } from './tabNavigation';
 
-export interface SavedEntity {
-  kind: 'artist' | 'album';
-  name: string;
-  artist?: string;
-  cover?: string;
-  destination: string;
-  keys?: string[];
-  id?: string;
-  added_at?: string;
-}
+import { sameEntity, type SavedEntity } from './savedEntityIdentity';
+export { entityKeys, sameEntity, type SavedEntity } from './savedEntityIdentity';
 
-export function entityKeys(entry: SavedEntity): string[] {
-  const params = new URLSearchParams(entry.destination.split('?')[1]);
-  const keys = [...(entry.keys ?? [])];
-  for (const [param, namespace] of [[`${entry.kind}_id`, 'library'], ['deezer_id', 'deezer']]) {
-    const id = params.get(param);
-    if (id) keys.push(`${entry.kind}:${namespace}:${id}`);
-  }
-  return keys.filter((key) => !key.includes(':reference:'));
+const [entities, setEntities] = createStore<{ entries: SavedEntity[] }>({ entries: [] });
+export const savedEntities = () => entities.entries;
+/** Keep bookmark/card identity across refreshes, while updating metadata in place. */
+export function setSavedEntities(value: SavedEntity[] | ((previous: SavedEntity[]) => SavedEntity[])): SavedEntity[] {
+  const next = typeof value === 'function' ? value(savedEntities()) : value;
+  setEntities('entries', reconcile(next, { key: 'destination' }));
+  return savedEntities();
 }
-
-export function sameEntity(a: SavedEntity, b: SavedEntity): boolean {
-  if (a.kind !== b.kind) return false;
-  const ak = entityKeys(a), bk = entityKeys(b);
-  if (ak.length || bk.length) return ak.some((key) => bk.includes(key));
-  return a.name === b.name && (a.artist ?? '') === (b.artist ?? '');
-}
-
-export const [savedEntities, setSavedEntities] = createSignal<SavedEntity[]>([]);
 export const [entitiesLoading, setEntitiesLoading] = createSignal(false);
 export const [entitiesError, setEntitiesError] = createSignal(false);
 export const [entitiesBusy, setEntitiesBusy] = createSignal(false);
@@ -87,7 +70,8 @@ export async function setEntitySaved(entry: SavedEntity, saved: boolean, opts: {
   if (entitiesBusy()) return;
   const current = ++generation;
   setEntitiesBusy(true);
-  const previous = savedEntities();
+  // Reconciliation updates the live store in place; rollback needs its own snapshot.
+  const previous = savedEntities().map(item => ({ ...item, ...(item.keys ? { keys: [...item.keys] } : {}) }));
   setSavedEntities(saved
     ? (isEntitySaved(entry) ? previous : [entry, ...previous])
     : previous.filter((item) => !sameEntity(item, entry)));

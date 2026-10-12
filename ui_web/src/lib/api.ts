@@ -1,5 +1,6 @@
 import type { SavedEntity } from './savedEntities';
 import { request } from './http';
+import type { DownloadEvidence } from './track';
 export { request, setUnauthorizedHandler, ApiError } from './http';
 import type {
   CatalogAlbum,
@@ -84,7 +85,7 @@ export interface DownloadItem {
   display_artist?: string;
   thumbnail_url?: string;
   duration_sec?: number;
-  metadata_evidence?: null;
+  metadata_evidence?: DownloadEvidence | null;
   /** Identity keys of the song being downloaded (see `lib/playbackIdentity.ts`).
    * A saved song carries its entry's keys, so the file joins that song — and
    * keeps the day it was saved — rather than arriving as a new one. */
@@ -587,7 +588,7 @@ export const api = {
   /** Devices registered for playback in this scope (for remote control). */
   listDevices: () => request<{ devices?: Device[] }>('/api/devices'),
   /** Send a transport command to another device (it acts via Socket.IO). */
-  remoteCommand: (deviceId: string, command: RemoteCommand, extra?: { track_id?: string; position_sec?: number }) =>
+  remoteCommand: (deviceId: string, command: RemoteCommand, extra?: { track_id?: string; track?: import('./playbackQueue').ContextTrack; position_sec?: number }) =>
     request<{ status?: string }>('/api/playback/remote-command', {
       method: 'POST',
       body: { device_id: deviceId, command, ...extra },
@@ -730,11 +731,11 @@ export const api = {
   /** Put a song in the library, or take it out. Nothing is downloaded. */
   /** Save many songs, or take them out, without flipping any — an album in
    * one act. Sent in batches the engine accepts. */
-  setSavedEntries: async (entries: SavedEntry[], saved: boolean) => {
+  setSavedEntries: async (entries: SavedEntry[], saved: boolean, options: { signal?: AbortSignal } = {}) => {
     for (let start = 0; start < entries.length; start += SAVED_BATCH) {
       await request<{ changed?: number }>('/api/library/saved/set', {
         method: 'POST',
-        body: { entries: entries.slice(start, start + SAVED_BATCH), saved },
+        body: { entries: entries.slice(start, start + SAVED_BATCH), saved }, signal: options.signal,
       });
     }
   },
@@ -805,9 +806,9 @@ export const api = {
     }),
 
   // ── Lyrics (LRCLIB via the engine; library tracks are cached server-side) ──
-  getTrackLyrics: (trackId: string) =>
+  getTrackLyrics: (trackId: string, options: { signal?: AbortSignal } = {}) =>
     request<LyricsResponse>(`/api/library/tracks/${encodeURIComponent(trackId)}/lyrics`, {
-      timeoutMs: 15000,
+      signal: options.signal, timeoutMs: 15000,
     }),
   /** Lyrics for tracks not in the library (previews), looked up by metadata. */
   getLyricsByMetadata: (p: {
@@ -819,7 +820,7 @@ export const api = {
     youtubeId?: string;
     persist?: boolean;
     refresh?: boolean;
-  }) => {
+  }, options: { signal?: AbortSignal } = {}) => {
     const params = new URLSearchParams({ artist: p.artist, title: p.title });
     if (p.album) params.set('album', p.album);
     if (p.duration) params.set('duration', String(Math.round(p.duration)));
@@ -827,8 +828,17 @@ export const api = {
     if (p.youtubeId) params.set('youtube_id', p.youtubeId);
     if (p.persist) params.set('persist', '1');
     if (p.refresh) params.set('refresh', '1');
-    return request<LyricsResponse>(`/api/lyrics?${params.toString()}`, { timeoutMs: 15000 });
+    return request<LyricsResponse>(`/api/lyrics?${params.toString()}`, { signal: options.signal, timeoutMs: 15000 });
   },
+
+  /** Line a recording's lyrics up by hand; `offsetMs: null` forgets it. A
+   * library track is named by id, a stream by its video. */
+  setLyricsOffset: (p: { trackId?: string; youtubeId?: string; offsetMs: number | null }) =>
+    request<{ offset_ms: number | null }>('/api/lyrics/offset', {
+      method: 'PUT',
+      body: { track_id: p.trackId, youtube_id: p.youtubeId, offset_ms: p.offsetMs },
+      timeoutMs: 15000,
+    }),
 
   // ── Track metadata + cover (engine rewrites the file's tags) ──
   updateTrackMetadata: (
@@ -1210,25 +1220,25 @@ export const api = {
 
   /** Download every song on an album the library does not hold yet. The
    * engine reads the tracklist itself; this only names the record. */
-  startAlbumDownload: (deezerId: string) =>
+  startAlbumDownload: (deezerId: string, signal?: AbortSignal) =>
     request<{ job: MigrationJob }>('/api/catalog/album/download', {
       method: 'POST',
-      body: { deezer_id: deezerId },
+      body: { deezer_id: deezerId }, signal,
       timeoutMs: 30000,
     }),
-  getAlbumDownload: (deezerId: string) =>
-    request<{ job: MigrationJob | null }>(`/api/catalog/album/download?deezer_id=${encodeURIComponent(deezerId)}`),
+  getAlbumDownload: (deezerId: string, signal?: AbortSignal) =>
+    request<{ job: MigrationJob | null }>(`/api/catalog/album/download?deezer_id=${encodeURIComponent(deezerId)}`, { signal }),
   /** An artist's albums, singles and EPs as one list of songs, each once. */
-  getArtistDiscography: (deezerId: string) =>
-    request<ArtistDiscography>(`/api/catalog/artist/discography?deezer_id=${encodeURIComponent(deezerId)}`, { timeoutMs: 60000 }),
-  startArtistDownload: (deezerId: string) =>
+  getArtistDiscography: (deezerId: string, signal?: AbortSignal) =>
+    request<ArtistDiscography>(`/api/catalog/artist/discography?deezer_id=${encodeURIComponent(deezerId)}`, { timeoutMs: 60000, signal }),
+  startArtistDownload: (deezerId: string, signal?: AbortSignal) =>
     request<{ job: MigrationJob }>('/api/catalog/artist/download', {
       method: 'POST',
-      body: { deezer_id: deezerId },
+      body: { deezer_id: deezerId }, signal,
       timeoutMs: 60000,
     }),
-  getArtistDownload: (deezerId: string) =>
-    request<{ job: MigrationJob | null }>(`/api/catalog/artist/download?deezer_id=${encodeURIComponent(deezerId)}`),
+  getArtistDownload: (deezerId: string, signal?: AbortSignal) =>
+    request<{ job: MigrationJob | null }>(`/api/catalog/artist/download?deezer_id=${encodeURIComponent(deezerId)}`, { signal }),
 
   getAlbumProfile: (name: string, artist: string, deezerId?: string, signal?: AbortSignal) =>
     request<AlbumProfile>(
@@ -1339,7 +1349,10 @@ export const api = {
       autoplay_enabled?: boolean;
       volume_leveling?: boolean;
       dj_mixing?: boolean;
+      podcast_country?: string;
     }>('/api/discovery/settings'),
+  setPodcastCountry: (country: string) =>
+    request<{ podcast_country: string }>('/api/discovery/settings', { method: 'PATCH', body: { podcast_country: country } }),
   setVolumeLeveling: (enabled: boolean) =>
     request<{ volume_leveling?: boolean }>('/api/discovery/settings', {
       method: 'PATCH',

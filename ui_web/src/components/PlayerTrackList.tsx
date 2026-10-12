@@ -2,6 +2,7 @@ import { ArtistLinks } from './MusicLinks';
 import type { MusicMetadata } from '../lib/musicNavigation';
 import { mobileListLayout } from '../lib/listLayout';
 import { MusicListRow } from './MusicListRow';
+import Button from './Button';
 import { VirtualRows } from './VirtualRows';
 import { openContextMenu } from '../lib/contextMenu';
 import { coverStyle } from '../lib/cover';
@@ -9,7 +10,7 @@ import { t } from '../lib/i18n';
 import type { MenuAction } from './ActionMenu';
 import { MoreIcon, menuIcons } from './icons';
 import type { SavedEntry } from '../types/music';
-import { createEffect, createSignal, For, onCleanup, Show, type JSX } from 'solid-js';
+import { createEffect, createMemo, createSignal, createUniqueId, For, onCleanup, Show, type JSX } from 'solid-js';
 import { createResponsiveTap, responsiveTapConstants } from '../lib/responsiveTap';
 import { claimHoldGesture, clearTextSelection } from '../lib/holdGesture';
 import {
@@ -46,6 +47,7 @@ export interface PlayerTrackListEntry {
   canMoveDown?: boolean;
   draggable?: boolean;
   onDragStart?: (event: DragEvent) => void;
+  onDragEnd?: (event: DragEvent) => void;
   onDragOver?: (event: DragEvent) => void;
   onDrop?: (event: DragEvent) => void;
   before?: JSX.Element;
@@ -58,7 +60,8 @@ export interface PlayerTrackListEntry {
  *
  * Drawn in the rows' language (artwork, a name, what it is, a menu) so it reads
  * as part of the same list, but it is never numbered, reordered or played as a
- * row: activating it opens what it stands for.
+ * row: activating it expands a collection's upcoming songs, or opens the page
+ * of one too large to read in the queue.
  */
 export interface PlayerTrackListCard {
   id: string;
@@ -72,6 +75,10 @@ export interface PlayerTrackListCard {
   /** Present but switched off: drawn quieter, and every control on it still
    * works exactly as it does when it is on. */
   dimmed?: boolean;
+  /** The collection's upcoming songs, built only as far as the card shows
+   * them. Undefined for what does not expand: generators such as Autoplay, and
+   * collections that open their page instead. */
+  songs?: { count: number; rows: (limit: number) => PlayerTrackListEntry[] };
   onOpen?: () => void;
   openLabel?: string;
   menu?: () => MenuAction[];
@@ -139,10 +146,24 @@ export function PlayerTrackList(props: {
   const [dragging, setDragging] = createSignal(false);
   // Sections rebuild their entry objects when the queue moves. Editing belongs
   // to the occurrence, not to a row instance that disappears after one nudge.
+  // How many songs each expanded card shows, by card; a collapsed card is absent.
+  const [expandedCards, setExpandedCards] = createSignal<ReadonlyMap<string, number>>(new Map());
+  const cardKey = (card: PlayerTrackListCard) => `${card.id}:${card.seed}`;
+  const showCardSongs = (card: PlayerTrackListCard, shown: number | null) => setExpandedCards(before => {
+    const after = new Map(before);
+    if (shown === null) after.delete(cardKey(card));
+    else after.set(cardKey(card), shown);
+    return after;
+  });
+  // Only an expanded card builds rows, and only as many as it shows.
+  const cardRows = createMemo(() => new Map(props.sections.flatMap(section => section.cards ?? []).flatMap(card => {
+    const shown = expandedCards().get(cardKey(card));
+    return card.songs && shown ? [[cardKey(card), card.songs.rows(shown)] as const] : [];
+  })));
   const [editingId, setEditingId] = createSignal<string | null>(null);
   let rowsEl: HTMLDivElement | undefined;
   createEffect(() => {
-    if (editingId() && !props.sections.some((section) => section.entries.some((entry) =>
+    if (editingId() && ![...props.sections.map(section => section.entries), ...cardRows().values()].some((entries) => entries.some((entry) =>
       entry.id === editingId() && !entry.current && !entry.locked))) setEditingId(null);
   });
   const focusRowControl = (id: string, command?: string) => queueMicrotask(() => {
@@ -159,6 +180,11 @@ export function PlayerTrackList(props: {
         null,
       );
     (preferred ?? fallback)?.focus();
+  });
+  const focusRowStart = (id: string) => queueMicrotask(() => {
+    [...(rowsEl?.querySelectorAll<HTMLElement>('[data-drag-row]') ?? [])]
+      .find((row) => row.dataset.dragRow === id)
+      ?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
   });
   let depth = 0;
   let scrollFrame: number | undefined;
@@ -262,27 +288,27 @@ export function PlayerTrackList(props: {
         }}
       >
         <Show when={props.sections.some(sectionHasContent)} fallback={<div class={styles.empty}>{props.empty}</div>}>
-          <For each={props.sections}>
+          <KeyedItems items={props.sections} getKey={section => section.id}>
             {(section) => (
-              <Show when={sectionHasContent(section)}>
+              <Show when={sectionHasContent(section())}>
                 <section
                   class={styles.section}
-                  data-head={section.label ? '' : undefined}
-                  data-long={section.entries.length > LANE_FLOOR_ROWS ? '' : undefined}
-                  data-cards={section.cards?.length ? '' : undefined}
-                  data-section={section.id}
+                  data-head={section().label ? '' : undefined}
+                  data-long={section().entries.length > LANE_FLOOR_ROWS ? '' : undefined}
+                  data-cards={section().cards?.length ? '' : undefined}
+                  data-section={section().id}
                 >
-                  <Show when={section.label}>
-                    <div class={styles.sectionHead} title={section.hint}>
-                      <span>{section.label}</span>
-                      <Show when={section.count !== undefined}>
-                        <span class={styles.sectionCount}>{section.count}</span>
+                  <Show when={section().label}>
+                    <div class={styles.sectionHead} title={section().hint}>
+                      <span>{section().label}</span>
+                      <Show when={section().count !== undefined}>
+                        <span class={styles.sectionCount}>{section().count}</span>
                       </Show>
                     </div>
                   </Show>
-                  <Show when={section.cards?.length} fallback={
-                  <PlayerLane virtualize={props.virtualize} entries={section.entries} editingId={editingId()}
-                    tail={<Show when={slot() && slot()!.index === section.entries.length}><div class={styles.seamTail} aria-hidden="true" /></Show>}>
+                  <Show when={section().cards?.length} fallback={
+                  <PlayerLane virtualize={props.virtualize} entries={section().entries} editingId={editingId()}
+                    tail={<Show when={slot() && slot()!.index === section().entries.length}><div class={styles.seamTail} aria-hidden="true" /></Show>}>
                     {(entry, index) => <>
                       {entry().before}
                       <PlayerTrackListRow entry={entry()} seam={slot()?.index === index()}
@@ -292,17 +318,52 @@ export function PlayerTrackList(props: {
                     </>}
                   </PlayerLane>}>
                     <div class={styles.sectionCards} data-section-cards>
-                      <For each={section.cards}>{(card) => <PlayerTrackListCardRow card={card} />}</For>
+                      <KeyedItems items={section().cards ?? []} getKey={cardKey}>{(card) => <PlayerTrackListCardRow card={card()} rows={cardRows().get(cardKey(card()))}
+                        onToggle={() => showCardSongs(card(), expandedCards().has(cardKey(card())) ? null : CARD_PAGE)}
+                        onShowMore={() => {
+                          const key = cardKey(card());
+                          const before = cardRows().get(key)?.length ?? 0;
+                          showCardSongs(card(), (expandedCards().get(key) ?? 0) + CARD_PAGE);
+                          // The last page takes "Show more" away with it: focus stays in the
+                          // list, on the first song that page revealed.
+                          const rows = cardRows().get(key) ?? [];
+                          if (rows[before] && rows.length >= (card().songs?.count ?? 0)) focusRowStart(rows[before].id);
+                        }}
+                        editingId={editingId()}
+                        onEditingChange={(id, editing) => { setEditingId(editing ? id : null); focusRowControl(id); }}
+                        onMove={(row, direction) => {
+                          // Moving the last song shown down takes it past the page: show the
+                          // next page with it, so the song being edited stays in sight.
+                          const shown = cardRows().get(cardKey(card()));
+                          if (direction > 0 && shown?.[shown.length - 1]?.id === row.id) {
+                            showCardSongs(card(), (expandedCards().get(cardKey(card())) ?? 0) + CARD_PAGE);
+                          }
+                          row.onMove?.(direction);
+                          focusRowControl(row.id, direction < 0 ? 'up' : 'down');
+                        }} />}</KeyedItems>
                     </div>
                   </Show>
                 </section>
               </Show>
             )}
-          </For>
+          </KeyedItems>
         </Show>
       </div>
     </div>
   );
+}
+
+/** Queue updates rebuild descriptors. Reconcile their keys, then read the
+ * latest descriptor through an accessor so headers and scrollers retain DOM identity. */
+function KeyedItems<T extends object>(props: {
+  items: readonly T[];
+  getKey: (item: T) => string;
+  children: (item: () => T) => JSX.Element;
+}) {
+  const items = createMemo(() => new Map(props.items.map(item => [props.getKey(item), item])));
+  return <For each={[...items().keys()]}>{key =>
+    <Show when={items().get(key)}>{item => props.children(item)}</Show>
+  }</For>;
 }
 
 function PlayerLane(props: {
@@ -325,17 +386,39 @@ function PlayerLane(props: {
   </div>;
 }
 
-function PlayerTrackListCardRow(props: { card: PlayerTrackListCard }) {
-  const tap = createResponsiveTap({
-    disabled: () => !props.card.onOpen,
-    onTap: () => props.card.onOpen?.(),
-  });
+/** Songs an expanded card shows at first, and adds each time it is asked for
+ * more: past this, an open collection pushes everything below it out of reach. */
+const CARD_PAGE = 12;
+
+function PlayerTrackListCardRow(props: { card: PlayerTrackListCard;
+  /** The rows the card shows; undefined while it is collapsed. */
+  rows: PlayerTrackListEntry[] | undefined;
+  onToggle: () => void; onShowMore: () => void;
+  editingId: string | null; onEditingChange: (id: string, editing: boolean) => void;
+  onMove: (entry: PlayerTrackListEntry, direction: -1 | 1) => void }) {
+  const contentsId = createUniqueId();
+  const expandable = () => props.card.songs !== undefined;
+  const expanded = () => expandable() && props.rows !== undefined;
+  const label = () => expandable()
+    ? t(expanded() ? 'nowPlaying.contextCollapse' : 'nowPlaying.contextExpand', { name: props.card.title })
+    : props.card.openLabel ?? props.card.title;
   const openMenu = (event?: MouseEvent) => {
     const actions = props.card.menu?.() ?? [];
     if (actions.length) openContextMenu({ title: props.card.title, subtitle: props.card.detail, actions }, event);
   };
-  const menuTap = createResponsiveTap({ onTap: (event) => { event.stopPropagation(); openMenu(); } });
+  // The phone has no room for a menu button beside the name: holding the card
+  // opens its menu, as holding a song does.
+  const tap = createResponsiveTap({
+    disabled: () => !expandable() && !props.card.onOpen && !props.card.menu,
+    onTap: () => {
+      if (expandable()) props.onToggle();
+      else if (props.card.onOpen) props.card.onOpen();
+      else openMenu();
+    },
+    get onLongPress() { return props.card.menu ? () => openMenu() : undefined; },
+  });
   return (
+    <div class={styles.collection}>
     <div
       class={styles.card}
       data-queue-card={props.card.id}
@@ -348,12 +431,16 @@ function PlayerTrackListCardRow(props: { card: PlayerTrackListCard }) {
       }}
     >
       <div class={styles.cardMain}>
-        <Show when={props.card.onOpen}>
+        <Show when={expandable() || props.card.onOpen || props.card.menu}>
           <button
             class={styles.playButton}
             type="button"
-            aria-label={props.card.openLabel ?? props.card.title}
-            data-card-open
+            aria-label={label()}
+            aria-expanded={expandable() ? expanded() : undefined}
+            aria-controls={expandable() ? contentsId : undefined}
+            aria-haspopup={!expandable() && !props.card.onOpen ? 'dialog' : undefined}
+            data-card-expand={expandable() ? '' : undefined}
+            data-card-open={!expandable() && props.card.onOpen ? '' : undefined}
             data-pressable
             onKeyDown={(event) => {
               if (props.card.menu && (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10'))) {
@@ -388,15 +475,12 @@ function PlayerTrackListCardRow(props: { card: PlayerTrackListCard }) {
             </button>
           )}
         </Show>
-        <Show when={props.card.menu && mobileListLayout()}>
-          <button class={styles.cardMenu} type="button" data-row-menu data-pressable aria-haspopup="dialog"
-            aria-label={`${t('songRow.ariaMore')}: ${props.card.title}`} {...menuTap}>
-            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
-              <circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" />
-            </svg>
+        <Show when={expandable()}>
+          <button class={styles.cardExpand} type="button" aria-label={label()} aria-expanded={expanded()} aria-controls={contentsId} onClick={props.onToggle}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" style={{ transform: expanded() ? 'rotate(180deg)' : undefined }}><path d="m6 9 6 6 6-6" /></svg>
           </button>
         </Show>
-        <Show when={!mobileListLayout() && props.card.remove}>
+        <Show when={props.card.remove}>
           {(remove) => (
             <button class={styles.cardRemove} type="button" aria-label={remove().label} onClick={() => remove().onSelect()}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
@@ -406,6 +490,23 @@ function PlayerTrackListCardRow(props: { card: PlayerTrackListCard }) {
           )}
         </Show>
       </span>
+    </div>
+    <Show when={expanded()}>
+      <div id={contentsId} class={styles.cardSongs} role="region" aria-label={props.card.title} data-card-songs>
+        <Show when={props.rows?.length} fallback={<p class={styles.cardEmpty}>{t('nowPlaying.contextNoUpcoming')}</p>}>
+          <PlayerLane entries={props.rows ?? []} editingId={props.editingId} tail={
+            <Show when={(props.card.songs?.count ?? 0) > (props.rows?.length ?? 0)}>
+              <div class={styles.cardMore}>
+                <Button variant="secondary" size="sm" data-card-more onClick={() => props.onShowMore()}>{t('nowPlaying.contextShowMore')}</Button>
+              </div>
+            </Show>
+          }>
+            {(entry) => <PlayerTrackListRow entry={entry()} editing={props.editingId === entry().id}
+              onEditingChange={editing => props.onEditingChange(entry().id, editing)} onMove={direction => props.onMove(entry(), direction)} />}
+          </PlayerLane>
+        </Show>
+      </div>
+    </Show>
     </div>
   );
 }
@@ -457,6 +558,7 @@ function PlayerTrackListRow(props: {
       data-stale={props.entry.stale ? '' : undefined}
       draggable={props.entry.draggable}
       onDragStart={props.entry.onDragStart}
+      onDragEnd={props.entry.onDragEnd}
       onDragOver={props.entry.onDragOver}
       onDrop={props.entry.onDrop}
       // Keep right-click alongside the visible menu. Mobile rows own their
